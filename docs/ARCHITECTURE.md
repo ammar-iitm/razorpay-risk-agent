@@ -147,17 +147,35 @@ tiers. This table — not a prompt instruction — is the source of truth, and
 
 | Tier | Meaning | Example rule |
 |---|---|---|
-| `auto` | Executes immediately, logged as `auto_executed` | Mid-risk (0.4-0.75) hold on amounts ≤ ₹10,000 |
-| `approval_required` | Agent's proposed action is logged as `queued_for_approval` and a human must execute it | High risk (≥0.75) holds; any amount > ₹10,000; submitting dispute evidence |
+| `auto` | Executes immediately, logged as `auto_executed` | Risk score ≥ 0.8 hold on amounts ≤ ₹10,000 |
+| `approval_required` | Agent's proposed action is logged as `queued_for_approval` and a human must execute it | Any amount > ₹10,000 (regardless of score); submitting dispute evidence |
 | `never_auto` | The tool function *cannot* execute the real effect no matter what — enforced in code, not just config | `accept_dispute` (conceding money) always returns `queued_for_approval`, by design, in `tool_accept_dispute()` |
 
 Rationale for the specific numbers:
 
-- **₹10,000 amount ceiling for auto-hold** — a hold is reversible (see §5),
-  so it's the lowest-stakes action available; a threshold roughly at the
-  median transaction size in most SMB merchant flows keeps the "auto" lane
-  useful without ever putting a large sum on autopilot. Tune with real data
-  on Day 4-5 once amount distributions are visible.
+- **`risk_score >= 0.8` for a hold, evidence-based from Day 5** —
+  `day5/evaluate.py` ran the actual rule engine (`day5/rule_engine.py`)
+  against PaySim and produced a real precision/recall curve
+  (`day5/pr_curve_results.csv`). `0.8` isn't a guess: it's exactly where
+  the rule engine's weights (`WEIGHT_TYPE` 0.3 + `WEIGHT_DRAIN` 0.5 = 0.8)
+  require both "risky transaction type" and "origin balance drained to
+  zero" to fire together — and recall jumps from 70% to 97.55% right at
+  that point, while precision barely moves either side of it. Above 0.8,
+  chasing a stricter score-only tier costs real recall for almost no
+  precision gain (see `day5/pick_thresholds.py`'s output), so there's
+  deliberately no separate, higher-score `approval_required` tier — see
+  below for why amount does that job instead.
+- **₹10,000 amount ceiling separates `auto` from `approval_required`, not
+  a second risk-score threshold** — a hold is reversible (see §5), so it's
+  the lowest-stakes action available. Since Day 5's evaluation showed the
+  rule engine's precision plateaus quickly above 0.8 (topping out around
+  1.6%), a second, stricter score cutoff wouldn't reliably distinguish
+  "very confident" from "somewhat confident" — the signal just isn't that
+  granular. Amount is the more honest lever: `mid_risk_small_amount_hold`
+  (score ≥ 0.8, amount ≤ ₹10,000) auto-holds; `large_amount_hold` (any
+  amount > ₹10,000) requires a human *regardless of score* — intentionally
+  conservative, since a large transaction deserves a look even at a lower
+  confidence flag.
 - **Any dispute submission requires a human** — this isn't a probability
   judgment, it's a category judgment: submitting evidence is irreversible
   and affects Razorpay's own relationship with the card network on the

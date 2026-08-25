@@ -134,15 +134,19 @@ CREATE TABLE policy_config (
     is_active                INTEGER NOT NULL DEFAULT 1
 );
 
--- Seed data: the actual starting policy (tune these numbers during Days 4-5,
--- but ship SOME defensible defaults from day one — see docs/ARCHITECTURE.md
--- for the reasoning behind each threshold).
+-- Seed data: thresholds below are evidence-based, not guessed — from Day 5's
+-- actual precision/recall evaluation against PaySim (day5/evaluate.py,
+-- day5/pick_thresholds.py). risk_score >= 0.8 is where day5/rule_engine.py's
+-- score structurally requires "risky type AND origin drained" to both fire
+-- (0.3 + 0.5 weights = 0.8 exactly) — recall jumps from 70% to 97.55% right
+-- at this threshold, while precision barely changes above it. See
+-- docs/ARCHITECTURE.md §4 for the full reasoning, including why there's
+-- deliberately no separate higher-score tier.
 INSERT INTO policy_config (rule_name, action_type, condition_json, autonomy_tier) VALUES
-('low_risk_no_action',        'no_action',               '{"risk_score":{"<":0.4}}',                              'auto'),
-('mid_risk_small_amount_hold','hold_payment',             '{"risk_score":{">=":0.4,"<":0.75},"amount":{"<=":1000000}}', 'auto'),
-('high_risk_hold',            'hold_payment',             '{"risk_score":{">=":0.75}}',                            'approval_required'),
+('low_risk_no_action',        'no_action',               '{"risk_score":{"<":0.8}}',                              'auto'),
+('mid_risk_small_amount_hold','hold_payment',             '{"risk_score":{">=":0.8},"amount":{"<=":1000000}}',    'auto'),
 ('large_amount_hold',         'hold_payment',             '{"amount":{">":1000000}}',                              'approval_required'),
-('release_after_review',      'release_payment',          '{"risk_score":{"<":0.4}}',                              'auto'),
+('release_after_review',      'release_payment',          '{"risk_score":{"<":0.8}}',                              'auto'),
 ('draft_evidence_always',     'draft_dispute_evidence',   '{}',                                                     'auto'),
 ('submit_evidence_gate',      'submit_dispute_evidence',  '{}',                                                     'approval_required'),
 ('accept_dispute_gate',       'accept_dispute',           '{}',                                                     'never_auto'),

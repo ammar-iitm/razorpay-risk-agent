@@ -390,25 +390,28 @@ def run_demo() -> None:
         "INSERT INTO transactions (payment_id, order_id, amount, currency, status, method, captured, email, razorpay_created_at) "
         "VALUES ('pay_demo_high', 'order_demo_high', 1500000, 'INR', 'captured', 'card', 1, 'risky@example.com', ?)", (now,)
     )
-    # score 0.55 -> hits 'mid_risk_small_amount_hold' (0.4 <= score < 0.75, amount <= 1,000,000) -> auto
+    # score 0.85 -> hits 'mid_risk_small_amount_hold' (risk_score >= 0.8 -- the
+    # evidence-based threshold from Day 5's precision/recall evaluation against
+    # PaySim, see docs/ARCHITECTURE.md Sec4 -- amount <= 1,000,000) -> auto
     conn.execute(
         "INSERT INTO risk_scores (payment_id, score, model_version, reason_codes, feature_snapshot, scoring_source) "
-        "VALUES ('pay_demo_mid', 0.55, 'hybrid-v0.1', '[\"new_email\"]', '{}', 'hybrid')"
+        "VALUES ('pay_demo_mid', 0.85, 'hybrid-v0.1', '[\"new_email\"]', '{}', 'hybrid')"
     )
-    # score 0.91, amount > 1,000,000 -> hits BOTH 'high_risk_hold' and 'large_amount_hold' -> approval_required either way
+    # score 0.91, amount > 1,000,000 -> hits 'large_amount_hold' (amount-based,
+    # applies regardless of score -- intentionally conservative) -> approval_required
     conn.execute(
         "INSERT INTO risk_scores (payment_id, score, model_version, reason_codes, feature_snapshot, scoring_source) "
         "VALUES ('pay_demo_high', 0.91, 'hybrid-v0.1', '[\"velocity_high\",\"amount_outlier\"]', '{}', 'hybrid')"
     )
     conn.commit()
 
-    print("--- Mid risk (0.55), small amount (Rs.500): expect auto_executed ---")
+    print("--- Mid risk (0.85), small amount (Rs.500): expect auto_executed ---")
     print(tool_hold_payment(conn, "pay_demo_mid", "Testing mid-risk auto-hold path"))
 
     print("\n--- High risk (0.91), large amount (Rs.15,000): expect queued_for_approval ---")
     print(tool_hold_payment(conn, "pay_demo_high", "Velocity spike + amount outlier detected"))
 
-    print("\n--- Note: a genuinely LOW-risk hold_payment call (score < 0.4) has NO matching")
+    print("\n--- Note: a genuinely LOW-risk hold_payment call (score < 0.8) has NO matching")
     print("    'auto' rule in policy_config, so it correctly fails safe to approval_required")
     print("    rather than silently defaulting to allow. This is intentional -- see")
     print("    evaluate_policy()'s fail-safe default and ARCHITECTURE.md.")

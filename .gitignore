@@ -18,5 +18,9 @@ data/*.zip
 *.sqlite
 *.sqlite3
 
+# Large generated evaluation output (one row per threshold over 6.3M rows —
+# regenerable by running day5/evaluate.py, don't belong in git history)
+day5/pr_curve_results.csv
+
 # OS cruft
 .DS_Store

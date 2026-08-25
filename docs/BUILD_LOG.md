@@ -169,6 +169,32 @@ Razorpay's API. The script calls `/v1/payments/{id}`, which needs a
 ID out of the terminal history. Fixed by pulling the actual `pay_...` ID
 from `checkout.html`'s result box instead.
 
----
+## Day 5 — the placeholder policy thresholds turned out to be wrong, in a useful way
 
-*(new entries append below this line as the build continues)*
+**What I found:** The original `policy_config` seed data (`mid_risk_small_amount_hold`
+at 0.4-0.75, `high_risk_hold` at ≥0.75) was a reasonable-sounding guess made
+before any real detector existed. Running `day5/evaluate.py`'s actual
+precision/recall curve against PaySim showed the real rule engine's useful
+threshold sits at **0.8**, not 0.4 or 0.75 — and it's not arbitrary: 0.8 is
+exactly `WEIGHT_TYPE (0.3) + WEIGHT_DRAIN (0.5)`, the point where "risky
+type" and "origin drained" both fire together. Recall jumps from 70% to
+97.55% right at that threshold and barely improves below it or above it —
+precision plateaus around 1.6% across the whole usable range.
+
+**What that meant for the policy:** a second, stricter score-only tier for
+`approval_required` wasn't defensible — the score just isn't granular
+enough above 0.8 to distinguish "fairly confident" from "very confident."
+Removed the separate `high_risk_hold` rule and let amount do that job
+instead (`large_amount_hold`, already in the schema, applies regardless of
+score — arguably more conservative anyway, since a large transaction
+deserves a human's eyes even at a lower confidence flag).
+
+**How I verified the change didn't silently break anything:** `run_demo()`
+in `agent_tools.py` had a scripted scenario built around the old 0.4-0.75
+placeholder (a 0.55-score transaction expecting `auto_executed`). Updating
+the threshold without touching the demo would have silently broken it —
+that transaction would've fallen through to the fail-safe
+`approval_required` default instead, contradicting the demo's own printed
+expectation. Updated the demo's test score to 0.85 and re-ran it end to end
+before shipping the change: audit chain intact, tamper detection still
+works, both scenarios resolve exactly as printed.
