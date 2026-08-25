@@ -197,11 +197,32 @@ Rationale for the specific numbers:
 
 Razorpay's API does not expose a native "freeze this payment" endpoint —
 capture/refund are the real levers. For this build, `hold_payment` is
-implemented as an internal state flag (`agent_actions` + a status field) that
-gates a *later* capture/refund decision, not a live call that mutates
-Razorpay's own ledger. This is intentionally documented rather than glossed
-over: better to be precise about what's simulated internal state vs. a real
-API mutation than to imply an integration depth that isn't there in 10 days.
+implemented as an internal state flag (`transactions.on_hold` / `held_at`,
+added Day 7 — kept as its own columns rather than folded into `status`, so
+Razorpay's own payment states and our review gate can never silently
+contradict each other) that gates a *later* capture/refund decision, not a
+live call that mutates Razorpay's own ledger. This is intentionally
+documented rather than glossed over: better to be precise about what's
+simulated internal state vs. a real API mutation than to imply an
+integration depth that isn't there in 10 days.
+
+**Day 7 update — the flag is now set from a live source, not blind trust in
+local state.** Before `tool_hold_payment` / `tool_release_payment` act, they
+call `agent/razorpay_client.py` to fetch the payment's real, current status
+from Razorpay's Payments API and reconcile it into `transactions.status` if
+it's changed since we last saw it. If the live status comes back
+`refunded` or `failed`, the tool short-circuits to `denied` with
+`policy_rule_applied = "live_status_check"` before `evaluate_policy()` is
+even consulted — there's nothing meaningful to hold on a payment that's
+already dead on Razorpay's side, and that's a factual check, not a policy
+judgment call, so it's deliberately not modeled as a policy rule. Without
+API credentials configured (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`), this
+step soft-fails to "skip live verification" and everything behaves exactly
+as it did before Day 7 — verified directly by re-running
+`agent_tools.py --demo` with zero credentials configured and confirming
+identical output to the pre-Day-7 version. Live-verified end to end against
+a real completed Razorpay test-mode checkout via
+[`day7/verify_live_hold.py`](../day7/verify_live_hold.py).
 
 ## 6. Evaluation methodology (the "honest metrics" requirement)
 
@@ -272,9 +293,23 @@ wants built.
 
 ## 10. Known limitations / explicitly out of scope for the 10-day build
 
-- Live Razorpay API calls are stubbed with `# TODO` markers in
-  `agent_tools.py`, to be filled in Day 6 once test API keys are wired up.
-- `hold_payment` is internal state, not a native Razorpay primitive (§5).
+- `hold_payment` / `release_payment` now fetch live payment status from
+  Razorpay before acting (Day 7, §5), but only the Payments-side read path
+  is live — `hold_payment` is still internal state, not a native Razorpay
+  primitive, since no such endpoint exists (§5).
+- Razorpay's test mode does **not** expose a way to simulate a dispute —
+  checked directly in the dashboard (Test Mode → Disputes) on Day 7 and
+  confirmed there's no "create test dispute" option, matching what
+  Razorpay's own API docs left ambiguous. This means `draft_dispute_evidence`
+  / `submit_dispute_evidence` / `accept_dispute` cannot be exercised against
+  a real live Razorpay dispute at all in a 10-day solo build — a live
+  dispute only exists when a real cardholder actually disputes a real
+  charge, which is out of scope to manufacture. These three tools are
+  verified via `day6/run_scenario.py`'s seeded-data live agent run (Claude
+  itself deciding to draft evidence and correctly NOT auto-submitting it)
+  plus unit-level checks, and that's the ceiling of what's honestly
+  verifiable here — stated plainly rather than implying a depth of API
+  integration that isn't achievable, not a gap I missed.
 - No SHAP/per-feature attribution (§7) — reason codes + feature snapshot only.
 - Audit chain has no external anchoring (§8).
 - Single-agent architecture — no multi-agent handoff (deliberately scoped

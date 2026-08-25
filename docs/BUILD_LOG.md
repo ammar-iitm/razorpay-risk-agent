@@ -228,6 +228,114 @@ still pending a human. Audit chain stayed intact through all four real,
 logged actions. No bugs to report this time — the "thin pass-through,
 single source of truth" design from Days 1-5 paid off directly here.
 
+## Day 7 — wiring live Razorpay checks in without breaking the zero-credential path
+
+**What I built:** `tool_hold_payment` / `tool_release_payment` in
+`agent_tools.py` had a literal no-op placeholder (`UPDATE transactions SET
+status = status`) where live Razorpay verification was supposed to go. Added
+`agent/razorpay_client.py` (a thin, deliberately soft-failing wrapper around
+`GET /v1/payments/{id}`) and a new `_verify_live_status()` helper both tools
+call before acting: it fetches the payment's real current status, syncs it
+into the local `transactions.status` if it's drifted, and — this is the part
+I want to call out — if the live status is `refunded` or `failed`, the tool
+short-circuits straight to `denied` *before* `evaluate_policy()` even runs,
+because "is there anything left to hold" is a factual question, not a policy
+judgment, and I didn't want to smuggle it into the policy table as a fake
+rule. Also added real `on_hold`/`held_at` columns to `transactions`
+(deliberately separate from Razorpay's own `status` field — see
+`ARCHITECTURE.md` §5 for why) so `hold_payment`'s auto-execution actually
+does something now instead of a no-op.
+
+**The thing I was most careful about, and checked rather than assumed:**
+this module is imported unconditionally at the top of `agent_tools.py`, and
+`agent_tools.py --demo` has to keep working with zero credentials and zero
+network — that's the whole point of the demo path, and it's what a judge
+running this cold will actually try first. So `razorpay_client.py` never
+raises on a missing key; `credentials_configured()` gates every real call,
+and anything unavailable returns `None`, which every caller treats as "skip
+live verification," not an error. Re-ran `agent_tools.py --demo` with no
+`RAZORPAY_KEY_ID`/`SECRET` set at all after wiring this in — output was
+byte-identical to the pre-Day-7 version (`held`, `queued_for_approval`, chain
+intact, tamper detection still catches row 1). Then checked the DB directly
+and confirmed `on_hold`/`held_at` actually got set on the held payment
+instead of the old no-op silently doing nothing.
+
+**Built but not yet run against a real live payment as of this entry:**
+`day7/verify_live_hold.py` — takes a real `pay_...` id from a completed Day
+2 test checkout, fetches it live, seeds a real transaction row from the
+actual API response (same field mapping as `day2/fetch_payment.py`, so
+there's one definition of "how a payment maps onto our schema," not two),
+then calls the real gated tools and prints the live-verification note that
+lands in `agent_reasoning`. Tested its failure paths in the sandbox (no
+args, malformed id, no credentials configured, and fake-but-valid-shaped
+credentials against a nonexistent payment) — all fail cleanly with a clear
+message and no traceback, including the case where it genuinely hits
+Razorpay's API and gets an auth rejection back. Haven't run it against a
+real completed checkout on my own machine yet — that's the next thing to do
+with actual test-mode keys.
+
+**Still open:** whether Razorpay's test mode supports simulating a dispute
+at all is unconfirmed — checked Razorpay's own API docs, found no
+documented "create test dispute" mechanism. Flagged this honestly in
+`ARCHITECTURE.md` §10 rather than guessing. If it turns out not to exist,
+the dispute-side tools (`draft/submit_dispute_evidence`, `accept_dispute`)
+stay verified the way they already are — Day 6's seeded live agent run plus
+unit-level checks — and that's a stated limitation, not a gap I'm pretending
+isn't there.
+
+## Day 7 — confirmed Razorpay test mode has no dispute simulation
+
+**What I asked you to check:** whether the Razorpay dashboard (Test Mode →
+Disputes) has any "create test dispute" or simulate option, since I
+couldn't confirm it either way from Razorpay's own API docs.
+
+**What we found:** it doesn't exist. You checked directly and there's no
+such option in test mode. This isn't a bug or something to keep digging
+for — it's a real constraint of the platform: a dispute only exists when an
+actual cardholder disputes an actual charge, and there's no test-mode
+shortcut to manufacture one.
+
+**What that means for the build:** `draft_dispute_evidence`,
+`submit_dispute_evidence`, and `accept_dispute` were always going to hit a
+ceiling on how "live" they could be verified, and now that ceiling is
+confirmed rather than assumed. They stay verified the way Day 6 already
+proved them — a real live Claude agent, using the real gated tools, making
+the correct call on seeded dispute data (drafting evidence, and correctly
+NOT auto-submitting it without human approval) — plus the unit-level checks
+underneath. Updated `ARCHITECTURE.md` §10 to state this as a confirmed
+platform limitation instead of an open question. Not treating this as
+something to route around with a fake dispute row dressed up as "live" —
+that would be less honest than just saying what was and wasn't checked
+against the real API, which is the whole point of this section existing.
+
+## Day 7 — first live run against a real payment, and a second fail-safe catch
+
+**What happened:** Ran `day7/verify_live_hold.py` against a real completed
+Razorpay test-mode checkout (₹499, card, `status=captured`). The hold worked
+exactly as designed — live status fetched (`captured`), policy evaluated,
+auto-held, `on_hold=1` and a real `held_at` timestamp written, all against
+genuine API data for the first time rather than seeded rows. Then called
+`tool_release_payment` on the same payment expecting `released`, and got
+`queued_for_approval` instead, with `on_hold` still `1`.
+
+**Why, and why it's not a bug:** the script seeds a 0.85 test risk score
+specifically to land the hold in the `auto` tier. That same score also
+feeds `release_payment`'s policy check — and `policy_config`'s
+`release_after_review` rule only auto-releases below a 0.8 score.
+0.85 doesn't clear that bar, so `evaluate_policy()` correctly finds no
+matching `auto` rule and fails safe to `approval_required`, exactly the
+same fail-safe path documented in the very first Day 1 entry of this log —
+except this time it triggered on a real live payment instead of a
+synthetic scenario I built to prove the mechanism worked.
+
+**Why I'm treating this as a good result, not a loose end:** a payment that
+got auto-held because it looked high-risk should NOT be releasable by the
+same automated pass that flagged it — that's arguably the correct security
+posture, not an accident of test data. Added an inline note to
+`verify_live_hold.py` so this reads as intended behavior on future runs
+instead of looking like a broken script, rather than "fixing" the test to
+avoid hitting the fail-safe.
+
 ---
 
 *(new entries append below this line as the build continues)*

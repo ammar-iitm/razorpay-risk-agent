@@ -33,6 +33,16 @@ from typing import Any, Optional
 DB_PATH = os.environ.get("RISK_AGENT_DB", os.path.join(os.path.dirname(__file__), "..", "risk_agent.db"))
 SCHEMA_PATH = os.environ.get("RISK_AGENT_SCHEMA", os.path.join(os.path.dirname(__file__), "..", "sql", "schema.sql"))
 
+# Soft-optional: this module must keep working with zero external
+# dependencies for --demo and the offline verification patterns used
+# throughout Days 1-6 (see agent/razorpay_client.py's own docstring for
+# why). If it's missing, live verification inside tool_hold_payment /
+# tool_release_payment just gets skipped, not a crash.
+try:
+    import razorpay_client
+except ImportError:
+    razorpay_client = None
+
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -185,25 +195,69 @@ def tool_get_risk_assessment(conn: sqlite3.Connection, payment_id: str) -> dict:
     return score
 
 
+def _verify_live_status(conn: sqlite3.Connection, payment_id: str, local_status: Optional[str], local_amount: Optional[int]) -> tuple[str, Optional[str], Optional[int]]:
+    """Day 7: check the payment's LIVE status on Razorpay before a
+    hold/release decision commits to anything, when credentials are
+    configured. A stale local record could show 'captured' when the
+    payment has actually since been refunded elsewhere — holding or
+    releasing based on stale local state would be a decision made on data
+    that's already wrong.
+
+    Returns (note_for_agent_reasoning, live_status_or_None, live_amount_or_local_amount).
+    Syncs sql/schema.sql's `status` column to the live value when they
+    differ, so the local record self-heals rather than staying stale.
+    """
+    if razorpay_client is None or not razorpay_client.credentials_configured():
+        return "live verification skipped (no Razorpay credentials configured)", None, local_amount
+
+    live_payment = razorpay_client.fetch_payment(payment_id)
+    if live_payment is None:
+        return "live verification skipped (payment not found on Razorpay, or request failed)", None, local_amount
+
+    live_status = live_payment.get("status")
+    live_amount = live_payment.get("amount", local_amount)
+    if live_status and live_status != local_status:
+        conn.execute("UPDATE transactions SET status = ? WHERE payment_id = ?", (live_status, payment_id))
+        conn.commit()
+    return f"live verification: status={live_status}", live_status, live_amount
+
+
 def tool_hold_payment(conn: sqlite3.Connection, payment_id: str, reason: str) -> dict:
-    txn = conn.execute("SELECT amount FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
-    amount = txn[0] if txn else None
+    txn = conn.execute("SELECT amount, status FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
+    local_amount, local_status = (txn[0], txn[1]) if txn else (None, None)
+
+    live_note, live_status, amount = _verify_live_status(conn, payment_id, local_status, local_amount)
+    full_reasoning = f"{reason} | {live_note}"
+
+    # A payment already refunded or failed on Razorpay's own side has
+    # nothing left to hold — this is a real state, not a policy question,
+    # so it's checked before evaluate_policy() rather than folded into it.
+    if live_status in ("refunded", "failed"):
+        result = {"status": "denied", "payment_id": payment_id, "note": f"live status is '{live_status}', nothing to hold"}
+        action_id = log_agent_action(
+            conn, payment_id=payment_id, dispute_id=None, action_type="hold_payment",
+            decision_tier="denied", risk_score_at_decision=None, policy_rule_applied="live_status_check",
+            agent_reasoning=full_reasoning, tool_input={"payment_id": payment_id, "reason": reason},
+            tool_output=result, actor="agent",
+        )
+        result["agent_action_id"] = action_id
+        return result
+
     score = latest_risk_score(conn, payment_id)
     context = {"amount": amount, "risk_score": score["score"] if score else None}
     tier, rule = evaluate_policy(conn, "hold_payment", context)
 
     if tier == "auto":
-        # TODO (Day 6): call razorpay_client.payment.fetch(payment_id) then
-        # your own "hold" flag propagation (Razorpay itself has no native
-        # "hold" endpoint — this is typically your own DB flag + a delayed
-        # capture/refund decision, documented as a design choice, not hidden).
-        conn.execute("UPDATE transactions SET status = status WHERE payment_id = ?", (payment_id,))  # placeholder no-op
+        conn.execute(
+            "UPDATE transactions SET on_hold = 1, held_at = ? WHERE payment_id = ?",
+            (int(time.time()), payment_id),
+        )
         conn.commit()
         result = {"status": "held", "payment_id": payment_id}
         action_id = log_agent_action(
             conn, payment_id=payment_id, dispute_id=None, action_type="hold_payment",
             decision_tier="auto_executed", risk_score_at_decision=context["risk_score"],
-            policy_rule_applied=rule, agent_reasoning=reason,
+            policy_rule_applied=rule, agent_reasoning=full_reasoning,
             tool_input={"payment_id": payment_id, "reason": reason}, tool_output=result, actor="agent",
         )
         result["agent_action_id"] = action_id
@@ -214,7 +268,7 @@ def tool_hold_payment(conn: sqlite3.Connection, payment_id: str, reason: str) ->
         conn, payment_id=payment_id, dispute_id=None, action_type="hold_payment",
         decision_tier="queued_for_approval" if tier == "approval_required" else "denied",
         risk_score_at_decision=context["risk_score"], policy_rule_applied=rule,
-        agent_reasoning=reason, tool_input={"payment_id": payment_id, "reason": reason},
+        agent_reasoning=full_reasoning, tool_input={"payment_id": payment_id, "reason": reason},
         tool_output=result, actor="agent",
     )
     result["agent_action_id"] = action_id
@@ -222,16 +276,23 @@ def tool_hold_payment(conn: sqlite3.Connection, payment_id: str, reason: str) ->
 
 
 def tool_release_payment(conn: sqlite3.Connection, payment_id: str, reason: str) -> dict:
+    txn = conn.execute("SELECT amount, status FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
+    local_amount, local_status = (txn[0], txn[1]) if txn else (None, None)
+    live_note, _live_status, _amount = _verify_live_status(conn, payment_id, local_status, local_amount)
+    full_reasoning = f"{reason} | {live_note}"
+
     score = latest_risk_score(conn, payment_id)
     context = {"risk_score": score["score"] if score else None}
     tier, rule = evaluate_policy(conn, "release_payment", context)
     decision_tier = "auto_executed" if tier == "auto" else ("queued_for_approval" if tier == "approval_required" else "denied")
     result = {"status": "released" if tier == "auto" else decision_tier, "payment_id": payment_id}
-    # TODO (Day 6): clear your own hold flag / notify Razorpay-side workflow.
+    if tier == "auto":
+        conn.execute("UPDATE transactions SET on_hold = 0 WHERE payment_id = ?", (payment_id,))
+        conn.commit()
     action_id = log_agent_action(
         conn, payment_id=payment_id, dispute_id=None, action_type="release_payment",
         decision_tier=decision_tier, risk_score_at_decision=context["risk_score"],
-        policy_rule_applied=rule, agent_reasoning=reason,
+        policy_rule_applied=rule, agent_reasoning=full_reasoning,
         tool_input={"payment_id": payment_id, "reason": reason}, tool_output=result, actor="agent",
     )
     result["agent_action_id"] = action_id

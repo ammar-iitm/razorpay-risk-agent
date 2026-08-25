@@ -41,7 +41,17 @@ CREATE TABLE transactions (
     txns_last_1h_same_email    INTEGER DEFAULT 0,   -- velocity feature
     txns_last_24h_same_card    INTEGER DEFAULT 0,   -- velocity feature
     is_new_email                INTEGER DEFAULT 0,   -- first time we've seen this email
-    amount_zscore_for_method   REAL                  -- how anomalous is this amount vs recent same-method txns
+    amount_zscore_for_method   REAL,                 -- how anomalous is this amount vs recent same-method txns
+    -- Day 7: real hold state. Not part of `status` on purpose -- Razorpay's
+    -- own payment states (created/authorized/captured/failed/refunded) are
+    -- the source of truth for what Razorpay itself thinks happened; a hold
+    -- is OUR system's own review gate layered on top, not a Razorpay state
+    -- (Razorpay has no native "freeze this payment" endpoint -- see
+    -- docs/ARCHITECTURE.md Sec5). Keeping it a separate column means a
+    -- payment's real Razorpay status and our hold flag can never contradict
+    -- each other in a way the `status` CHECK constraint would hide.
+    on_hold                      INTEGER NOT NULL DEFAULT 0,
+    held_at                       INTEGER               -- unix ts hold was placed, NULL if never held
 );
 
 CREATE INDEX idx_transactions_email ON transactions(email);
