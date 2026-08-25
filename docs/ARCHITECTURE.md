@@ -87,6 +87,58 @@ pandas/sklearn were new tools going into this build, not prior experience —
 sequencing it this way means a skipped classifier costs nothing, where a
 skipped rule engine would have cost the whole track.
 
+## 3a. Feature engineering: what actually transfers from PaySim to Razorpay (Day 4)
+
+Day 3's exploration of PaySim (see `day3/FINDINGS.md`) surfaced three
+candidate fraud signals. Porting them onto real Razorpay data honestly,
+rather than assuming they all carry over, mattered enough to document
+explicitly:
+
+- **Amount** transfers directly. Razorpay payments have a real `amount`
+  field, so `amount_zscore_for_method` — how many standard deviations this
+  payment's amount is from the recent mean for the *same payment method*
+  (card vs. UPI vs. netbanking have very different normal ranges, so
+  comparing across methods would just be noise) — is a legitimate, direct
+  descendant of Day 3's amount-skew finding.
+- **Transaction type** has only a loose analog. PaySim's fraud concentration
+  in `TRANSFER`/`CASH_OUT` doesn't map cleanly onto Razorpay's `method`
+  field (`card`/`upi`/`netbanking`/`wallet`/`emi`), and there's no labeled
+  real-world data available to this project to calibrate per-method fraud
+  rates against. Deliberately **not** hardcoded as a rule in Day 4 —
+  revisit only if Day 5's evaluation shows a clear need, with real evidence,
+  not a guess ported from a different domain.
+- **Origin-balance-drained-to-zero — does not exist in this project's real
+  data, at all.** PaySim's strongest signal needs before/after account
+  balances. Razorpay is a payment gateway, not a bank ledger: the actual
+  payment payload verified live in Day 2 (`fetch_payment.py`) has no
+  balance fields on either side. This isn't a simplification — it's a
+  signal that is structurally unavailable here, and pretending otherwise
+  would be exactly the kind of hidden gap the "honest metrics" requirement
+  in §6 exists to prevent.
+
+**What replaces it:** velocity and identity checks —
+`txns_last_1h_same_email`, `txns_last_24h_same_card`, `is_new_email` (all
+three already reserved as columns in `sql/schema.sql`). These are the
+standard substitute in real payment-gateway fraud detection when
+account-balance data isn't available, and arguably fit this project's
+actual threat model (card-testing sprees, stolen-card runs, one identity
+attempting many payments fast) better than balance drainage would have
+anyway, which is more of a bank-account/wallet-fraud concern than a
+gateway-fraud one.
+
+Implementation: `day4/feature_engineering.py` — pure, database-free
+`compute_features()` for the core logic plus a thin `compute_features_from_db()`
+I/O wrapper, same "testable core, thin wrapper" split as `webhook_verify.py`
+and `agent_tools.py`'s `tool_*` functions. Verified by
+`day4/test_feature_engineering.py` (13/13 checks passing), including a check
+that runs the wrapper against the *actual* `sql/schema.sql` DDL loaded into
+an in-memory SQLite database, not just a hand-rolled dict shape that could
+silently drift from the real schema. Cold-start is handled explicitly too:
+`amount_zscore_for_method` returns `NULL`/`None` rather than a fabricated
+`0.0` when fewer than two same-method transactions exist yet to compare
+against — a `0.0` would falsely claim "perfectly average," which the
+function has no basis to assert with that little history.
+
 ## 4. The autonomy-tier policy (the "bounded and gated" story)
 
 Every tool the agent can call is mapped, in `policy_config`, to one of three
