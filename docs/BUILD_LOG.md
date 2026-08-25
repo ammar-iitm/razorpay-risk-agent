@@ -198,3 +198,36 @@ that transaction would've fallen through to the fail-safe
 expectation. Updated the demo's test score to 0.85 and re-ran it end to end
 before shipping the change: audit chain intact, tamper detection still
 works, both scenarios resolve exactly as printed.
+
+## Day 6 — the orchestrator worked end to end on the first live run
+
+**What I built:** Replaced `run_agent()`'s stub with the real Claude Agent
+SDK wiring — all 7 tools exposed, each a thin pass-through to the already-
+gated `tool_*` functions so there's exactly one implementation of the
+policy logic. Deliberately did NOT duplicate `evaluate_policy()`'s
+auto/approval_required decision inside the `can_use_tool` permission
+handler — that handler only sees raw tool arguments, not the amount/risk-
+score context the real decision needs, so reimplementing it there would
+create two places that could silently drift apart (the exact bug class
+`day5/evaluate.py`'s consistency check exists to prevent elsewhere in this
+project). Instead `can_use_tool` does input validation — denies a tool call
+outright if `payment_id`/`dispute_id` doesn't look like a real Razorpay id
+(`pay_.../disp_...`), a genuinely different and non-redundant check.
+
+**How I verified it, same two-tier pattern as Day 1's `calculator_with_gate.py`:**
+an offline check (`verify_handler_offline()`) that calls the permission
+handler directly with malformed and well-formed ids, zero API cost — then a
+real live run (`day6/run_scenario.py --live`) against seeded data. The live
+run actually worked correctly on the first try: Claude called
+`get_risk_assessment` on two payments, correctly auto-held the small-amount
+one and correctly got the large-amount one queued for human approval
+(matching Day 5's evidence-based `large_amount_hold` policy exactly),
+drafted — but never submitted — dispute evidence, and sent one merchant
+notification that explicitly separated what actually executed from what's
+still pending a human. Audit chain stayed intact through all four real,
+logged actions. No bugs to report this time — the "thin pass-through,
+single source of truth" design from Days 1-5 paid off directly here.
+
+---
+
+*(new entries append below this line as the build continues)*

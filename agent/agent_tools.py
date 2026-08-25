@@ -315,62 +315,137 @@ def tool_notify_merchant(conn: sqlite3.Connection, payment_id: str, message: str
 
 
 # ============================================================================
-# 4. CLAUDE AGENT SDK WIRING  (TODO — Day 4)
-#    This is where the tool EXECUTION functions above get exposed to Claude
-#    as callable tools, using the @tool decorator pattern from the Agent SDK
-#    docs (https://code.claude.com/docs/en/agent-sdk/python). Left as a
-#    documented stub so this file still runs with zero dependencies until
-#    you `pip install claude-agent-sdk` and plug in ANTHROPIC_API_KEY.
+# 4. CLAUDE AGENT SDK WIRING  (Day 6)
+#    Exposes the tool EXECUTION functions above to Claude as callable tools.
+#    Deliberately thin: every @tool wrapper below just calls the already-
+#    gated, already-tested tool_* function and returns its result — there is
+#    exactly ONE implementation of the policy-gating logic, whether Claude
+#    calls a tool or a test script calls tool_hold_payment() directly.
 # ============================================================================
 
-async def run_agent(user_prompt: str) -> None:
-    """
-    TODO (Day 4): uncomment and complete. Sketch below matches the SDK's
-    documented pattern — @tool decorator + create_sdk_mcp_server +
-    can_use_tool permission handler wired to evaluate_policy().
+async def _validate_tool_input(tool_name: str, input_data: dict, context: Any) -> Any:
+    """The can_use_tool permission handler for the risk agent.
 
+    Deliberately an INPUT-VALIDATION gate, not a second copy of
+    evaluate_policy(). The real auto / approval_required / never_auto
+    decision needs the full context (amount, current risk score) that's
+    already assembled inside each tool_* function above — reimplementing
+    that decision here, in a callback that only sees raw tool arguments,
+    would mean two places that decide the same thing and can silently drift
+    apart. That's exactly the failure mode day5/evaluate.py's consistency
+    check exists to prevent elsewhere in this project, so it's avoided here
+    on purpose, not by oversight.
+
+    What this DOES catch, which the tool functions don't: a malformed or
+    hallucinated payment_id/dispute_id — Razorpay's real ids are always
+    prefixed (pay_.../disp_...), so a value that isn't shaped like one is a
+    data-validity problem, not a policy question, and belongs at the
+    permission boundary rather than duplicated into every tool function.
+    """
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    payment_id = input_data.get("payment_id")
+    if payment_id is not None and not str(payment_id).startswith("pay_"):
+        return PermissionResultDeny(
+            message=f"'{payment_id}' doesn't look like a real Razorpay payment id (expected pay_...) — refusing rather than evaluating policy against garbage input.",
+            interrupt=False,
+        )
+    dispute_id = input_data.get("dispute_id")
+    if dispute_id is not None and not str(dispute_id).startswith("disp_"):
+        return PermissionResultDeny(
+            message=f"'{dispute_id}' doesn't look like a real Razorpay dispute id (expected disp_...) — refusing rather than evaluating policy against garbage input.",
+            interrupt=False,
+        )
+    return PermissionResultAllow(updated_input=input_data)
+
+
+async def run_agent(user_prompt: str, conn: Optional[sqlite3.Connection] = None, max_turns: int = 8) -> None:
+    """Runs one live Claude Agent SDK loop with all 7 risk tools wired up.
+
+    conn: pass an existing connection to reuse seeded demo data (see
+    day6/run_scenario.py); if omitted, opens and closes its own.
+    """
     from claude_agent_sdk import (
         tool, create_sdk_mcp_server, ClaudeAgentOptions, ClaudeSDKClient,
-        AssistantMessage, TextBlock, PermissionResultAllow, PermissionResultDeny,
+        AssistantMessage, TextBlock,
     )
 
-    conn = get_conn()
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
 
-    @tool(name="get_risk_assessment", description="...", input_schema={"payment_id": str})
-    async def _get_risk_assessment(args):
+    @tool(name="get_risk_assessment", description="Fetch the current risk score and reason codes for a payment. Read-only, never gated.", input_schema={"payment_id": str})
+    async def _get_risk_assessment(args: dict) -> dict:
         return {"content": [{"type": "text", "text": json.dumps(tool_get_risk_assessment(conn, args["payment_id"]))}]}
 
-    # ... one @tool wrapper per function above, each delegating to the
-    # already-gated tool_* function so the SAME policy logic applies whether
-    # Claude calls the tool or you call it directly in a test.
+    @tool(name="hold_payment", description="Place a payment on hold pending review. Reversible. Gated by policy_config.", input_schema={"payment_id": str, "reason": str})
+    async def _hold_payment(args: dict) -> dict:
+        return {"content": [{"type": "text", "text": json.dumps(tool_hold_payment(conn, args["payment_id"], args["reason"]))}]}
 
-    risk_server = create_sdk_mcp_server(name="risk", version="0.1.0", tools=[
-        _get_risk_assessment,  # , _hold_payment, _release_payment, ...
-    ])
+    @tool(name="release_payment", description="Release a previously held payment back to normal processing. Gated by policy_config.", input_schema={"payment_id": str, "reason": str})
+    async def _release_payment(args: dict) -> dict:
+        return {"content": [{"type": "text", "text": json.dumps(tool_release_payment(conn, args["payment_id"], args["reason"]))}]}
+
+    @tool(name="draft_dispute_evidence", description="Draft (never submit) an evidence package for a chargeback dispute. Always auto-allowed — no money impact.", input_schema={"dispute_id": str})
+    async def _draft_dispute_evidence(args: dict) -> dict:
+        return {"content": [{"type": "text", "text": json.dumps(tool_draft_dispute_evidence(conn, args["dispute_id"]))}]}
+
+    @tool(name="submit_dispute_evidence", description="Submit drafted evidence to contest a chargeback. Irreversible — always gated regardless of confidence.", input_schema={"dispute_id": str, "evidence": dict})
+    async def _submit_dispute_evidence(args: dict) -> dict:
+        return {"content": [{"type": "text", "text": json.dumps(tool_submit_dispute_evidence(conn, args["dispute_id"], args["evidence"]))}]}
+
+    @tool(name="accept_dispute", description="Recommend conceding a dispute (funds stay deducted). Can NEVER auto-execute — always returns queued_for_approval, enforced in code.", input_schema={"dispute_id": str, "reason": str})
+    async def _accept_dispute(args: dict) -> dict:
+        return {"content": [{"type": "text", "text": json.dumps(tool_accept_dispute(conn, args["dispute_id"], args["reason"]))}]}
+
+    @tool(name="notify_merchant", description="Send an informational message to the merchant. No money impact, always allowed.", input_schema={"payment_id": str, "message": str})
+    async def _notify_merchant(args: dict) -> dict:
+        return {"content": [{"type": "text", "text": json.dumps(tool_notify_merchant(conn, args["payment_id"], args["message"]))}]}
+
+    risk_server = create_sdk_mcp_server(
+        name="risk",
+        version="0.1.0",
+        tools=[
+            _get_risk_assessment, _hold_payment, _release_payment, _draft_dispute_evidence,
+            _submit_dispute_evidence, _accept_dispute, _notify_merchant,
+        ],
+    )
 
     options = ClaudeAgentOptions(
         system_prompt=(
             "You are a payments risk agent for a Razorpay merchant. You may "
             "recommend and, where policy allows, execute actions on flagged "
             "transactions and disputes. Every action you take is logged with "
-            "your reasoning. Never claim an action succeeded if the tool "
-            "returned 'queued_for_approval' or 'denied' — report it honestly "
-            "as pending human review."
+            "your reasoning, whether it executed immediately or was queued "
+            "for human approval. Never claim an action succeeded if a tool "
+            "result's status is 'queued_for_approval' or 'denied' — report "
+            "that plainly as pending human review, and mention which policy "
+            "rule applied if the result includes one. Always call "
+            "get_risk_assessment before deciding what to do about a payment "
+            "you haven't already scored earlier in this conversation."
         ),
         mcp_servers={"risk": risk_server},
-        allowed_tools=["mcp__risk__get_risk_assessment"],  # add the rest as you wire them
-        permission_mode="dontAsk",
+        allowed_tools=[
+            "mcp__risk__get_risk_assessment", "mcp__risk__hold_payment", "mcp__risk__release_payment",
+            "mcp__risk__draft_dispute_evidence", "mcp__risk__submit_dispute_evidence",
+            "mcp__risk__accept_dispute", "mcp__risk__notify_merchant",
+        ],
+        can_use_tool=_validate_tool_input,
+        permission_mode="default",
+        max_turns=max_turns,
     )
 
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(user_prompt)
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        print(block.text)
-    """
-    raise NotImplementedError("Wire this up on Day 4 — see docstring above.")
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(user_prompt)
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            print(f"Claude: {block.text}")
+    finally:
+        if own_conn:
+            conn.close()
 
 
 # ============================================================================
