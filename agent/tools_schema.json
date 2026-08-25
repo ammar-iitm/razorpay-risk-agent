@@ -1,0 +1,147 @@
+{
+  "_comment": "JSON Schema for every tool the risk agent can call. This file is the contract between agent/agent_tools.py and docs/ARCHITECTURE.md — keep them in sync. Each tool has a 'money_impact' field used by the permission handler to decide default caution even before policy_config is consulted.",
+
+  "tools": [
+    {
+      "name": "get_risk_assessment",
+      "description": "Fetch (or compute, if not cached) the current risk score and reason codes for a payment. Read-only, never gated.",
+      "money_impact": "none",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "payment_id": { "type": "string", "description": "Razorpay payment id, e.g. pay_L0nSsccovt6zyp" }
+        },
+        "required": ["payment_id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "reason_codes": { "type": "array", "items": { "type": "string" } },
+          "model_version": { "type": "string" },
+          "feature_snapshot": { "type": "object" }
+        }
+      }
+    },
+    {
+      "name": "hold_payment",
+      "description": "Place a payment on hold pending review. Does not refund or capture — reversible. Gated by policy_config rules for action_type=hold_payment.",
+      "money_impact": "reversible",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "payment_id": { "type": "string" },
+          "reason": { "type": "string", "description": "Human-readable justification, logged verbatim to agent_actions.agent_reasoning" }
+        },
+        "required": ["payment_id", "reason"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["held", "queued_for_approval", "denied"] },
+          "agent_action_id": { "type": "integer" }
+        }
+      }
+    },
+    {
+      "name": "release_payment",
+      "description": "Release a previously held payment back to normal processing. Gated by policy_config rules for action_type=release_payment.",
+      "money_impact": "reversible",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "payment_id": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["payment_id", "reason"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["released", "queued_for_approval", "denied"] },
+          "agent_action_id": { "type": "integer" }
+        }
+      }
+    },
+    {
+      "name": "draft_dispute_evidence",
+      "description": "Draft (but never submit) an evidence package for a chargeback dispute, using payment metadata and evidence templates. Always auto-allowed — drafting has no money impact, only submission does.",
+      "money_impact": "none",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dispute_id": { "type": "string" }
+        },
+        "required": ["dispute_id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": { "type": "string" },
+          "explanation_letter": { "type": "string" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Agent's own confidence that this evidence will win the dispute" }
+        }
+      }
+    },
+    {
+      "name": "submit_dispute_evidence",
+      "description": "Submit drafted evidence to Razorpay's Disputes API to contest a chargeback. IRREVERSIBLE and reputationally sensitive — always gated, regardless of risk score, per policy_config rule 'submit_evidence_gate'.",
+      "money_impact": "irreversible",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dispute_id": { "type": "string" },
+          "evidence": { "type": "object", "description": "The evidence object, normally the output of draft_dispute_evidence after human review" }
+        },
+        "required": ["dispute_id", "evidence"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["submitted", "queued_for_approval", "denied"] },
+          "agent_action_id": { "type": "integer" }
+        }
+      }
+    },
+    {
+      "name": "accept_dispute",
+      "description": "Concede a dispute (merchant does not contest, funds stay deducted). IRREVERSIBLE and always requires a human — policy_config rule 'accept_dispute_gate' is autonomy_tier=never_auto, meaning the agent may only ever RECOMMEND this action.",
+      "money_impact": "irreversible",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dispute_id": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["dispute_id", "reason"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["queued_for_approval", "denied"], "description": "Note: 'accepted' is never a valid direct output — see money_impact" },
+          "agent_action_id": { "type": "integer" }
+        }
+      }
+    },
+    {
+      "name": "notify_merchant",
+      "description": "Send an informational message to the merchant (e.g. WhatsApp/email summary). No money impact, always allowed.",
+      "money_impact": "none",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "payment_id": { "type": "string" },
+          "message": { "type": "string" }
+        },
+        "required": ["payment_id", "message"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["sent"] },
+          "agent_action_id": { "type": "integer" }
+        }
+      }
+    }
+  ]
+}

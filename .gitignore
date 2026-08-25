@@ -1,0 +1,22 @@
+# Secrets — never commit these
+.env
+*.env
+kaggle.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Datasets — large, publicly downloadable, don't belong in git history
+data/*.csv
+data/*.zip
+*.zip
+
+# Local runtime artifacts — regenerable, not source
+*.db
+*.sqlite
+*.sqlite3
+
+# OS cruft
+.DS_Store
