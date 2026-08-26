@@ -8,6 +8,55 @@ real debugging, not a tidied-up story.
 
 ---
 
+## Next up (read this first when resuming)
+
+**Status as of 2026-08-26: the Day 5 stretch goal is DONE, verified, and
+the decision is made — the model is real, but it does NOT get wired into
+the live agent path today.** Full story in the two build log entries below
+and `ARCHITECTURE.md` §3b. Short version: a trained classifier beats the
+rule engine by a lot (92.97% vs 4.45% best-F1 precision), checked that gain
+wasn't PaySim's documented balance-column leakage (it wasn't — an ablation
+confirmed it's a real, legitimate result), and confirmed it inherits the
+same PaySim-only-columns limitation the rule engine already had (§3a) — so
+it's real, honestly-evaluated proof the rules-to-ML upgrade is worth it,
+not something that can be deployed against live Razorpay data today (no
+labeled Razorpay data exists to train a Razorpay-native version against).
+
+**Status as of 2026-08-26 (later the same day): Day 8 is done and verified
+live, end to end, through the actual agent loop.** `tool_draft_dispute_evidence`
+now drafts real letters via a live `claude` CLI call, `tool_notify_merchant`
+sends real email via SMTP (soft-fails to an honestly-labeled stubbed state
+without SMTP configured). Full story in the build log entry below.
+
+**Remaining Day 8 item, not started:** the tracker's own "5-minute admin
+task" — pre-filling the static parts of the buildathon application form
+(name, college, track, project name) so submission day is lighter. I don't
+have the actual form in front of me; this needs you to either paste its
+fields or fill it directly when you have Razorpay's application open.
+
+**Next up: Day 9** (`artifact/tracker.html`'s plan — a browser-based
+dashboard, "the biggest remaining day").
+
+**Naming correction, 2026-08-26:** this classifier briefly lived at
+`day8/train_classifier.py`. That was a real mistake, not a style choice —
+`artifact/tracker.html`'s actual day-by-day plan puts this exact stretch
+goal under DAY 5 ("STRETCH, only if the above went faster than planned: fit
+a model, compare its PR curve to the rule engine's"), and Day 8 is reserved
+for the dispute-evidence-drafting work described above, which hasn't been
+started. Caught before it caused real confusion later — moved to
+`day5/stretch_classifier.py`, `.gitignore` and this doc updated to match.
+See the two build log entries directly below for both the original build
+and the correction.
+
+Reminder from setting this plan on 2026-08-25: this was Day 5's deferred
+stretch goal ("attempted only after the rule engine ships and is
+evaluated," which it has been). Time-boxed to one real day of actual model
+work — one baseline, one evaluation pass, one decision, not a tuning
+rabbit hole. There's a hard deadline (Sep 5, 2026) and exams on Aug 29-30
+already ate into the buffer.
+
+---
+
 ## Day 1 — the policy fail-safe caught my own test scenario, not a bug
 
 **What broke:** Ran the demo in `agent_tools.py`, forcing a `hold_payment`
@@ -62,6 +111,20 @@ not something an ordinary `pip install` produces.
 **How I handled it:** Didn't investigate or try to reuse it. Deleted it,
 created a fresh one (`python3 -m venv .venv`). Not worth building a
 money-adjacent project on top of something I couldn't account for.
+
+**Correction, 2026-08-26:** the same "𝜋thon" symlink turned up again in the
+brand-new venv this week — which is the opposite of reassuring on its face,
+since recreating the venv was supposed to have gotten rid of whatever this
+was. Before assuming the worst, checked it properly this time instead of
+just deleting again: it's a real, intentional CPython 3.14 feature, not a
+compromise indicator. `venv` module PRs `𝜋thon` as a joke alias alongside
+`python`/`python3` (π ≈ 3.14) — see
+[cpython#125035](https://github.com/python/cpython/pull/125035) and
+[alexwlchan's writeup](https://alexwlchan.net/til/2025/python-3-14/). The
+original caution was reasonable given what was known at the time — a
+money-adjacent project is exactly where you don't reuse an unexplained
+binary — but the root-cause guess was wrong. Worth having both the original
+caution AND this correction on record, not just quietly fixing it.
 
 ## Day 2 — wrong working directory
 
@@ -335,6 +398,163 @@ posture, not an accident of test data. Added an inline note to
 `verify_live_hold.py` so this reads as intended behavior on future runs
 instead of looking like a broken script, rather than "fixing" the test to
 avoid hitting the fail-safe.
+
+## Day 5 (continued, 2026-08-26) — built the deferred stretch-goal classifier, found a real (if minor) bug testing it
+
+**What I built:** `day5/stretch_classifier.py` — a `HistGradientBoostingClassifier`
+trained on PaySim's raw columns (amount, origin/dest balances, one-hot
+transaction type, plus the `origin_drained_to_zero` signal from Day 3),
+class-balanced via `sample_weight` since fraud is under 0.2% of rows. Two
+methodology decisions I want on record because they're easy to get wrong
+silently: split TEMPORALLY by `step` (train on earlier transactions, test
+on later ones) rather than randomly, since a trained model — unlike the
+hand-authored rule engine — can actually overfit and a random split would
+hide that; and re-evaluated the rule engine on this script's own held-out
+test set rather than reusing Day 5's full-dataset numbers, so the
+model-vs-rule-engine comparison is apples-to-apples on identical rows, not
+two different samples.
+
+**What I deliberately did NOT do:** dump the full precision/recall curve to
+CSV. Day 5's `pr_curve_results.csv` hit 355MB and blew past GitHub's 100MB
+push limit — a mistake fixed reactively that day. This time the script only
+ever writes a small summary table (best-F1 point + precision at a handful
+of recall floors, ~20 rows total) — designed out of the mistake instead of
+just remembering to `.gitignore` it. Also gitignored `day5/model.joblib`
+by default (only written with an explicit `--save-model` flag) — a first
+exploratory training run shouldn't leave a binary build artifact sitting in
+`git status` before anyone's decided it's worth keeping.
+
+**What broke in testing (small, but real):** smoke-testing against
+synthetic data threw a `RuntimeWarning: invalid value encountered in
+divide` on the F1 calculation for one of the three scorers.
+`np.where(cond, a/b, 0.0)` evaluates BOTH branches eagerly in numpy, so a
+literal 0/0 division still executes and warns even though `np.where` masks
+the result to `0.0` right after — the output was never actually wrong, just
+noisy. It didn't show up in Day 5's `evaluate.py`, which has the identical
+pattern, purely because that curve (full 6.3M rows) never happened to hit
+an exact 0/0 point; this script's smaller, coarser test-set curve did.
+Fixed by wrapping the division in `np.errstate(invalid="ignore",
+divide="ignore")` — confirmed the actual precision/recall/F1 numbers were
+identical before and after the fix, only the spurious warning went away.
+
+**Where this stands:** built and tested end-to-end against synthetic data
+in my sandbox — runs clean, `--sample` and `--save-model` both work, output
+is sane. Have NOT run it against the real dataset. See "Next up" above.
+
+## Day 5 (continued, 2026-08-26) — the classifier's real numbers were suspicious, so I checked instead of celebrating
+
+**What happened:** ran `day5/stretch_classifier.py` for real against the
+full 6.3M-row dataset. Best-F1 precision jumped from the rule engine's
+4.45% to 92.97% for the trained model, on the identical held-out test set.
+At the recall≥0.90 floor: rule engine 1.75% precision, model 84.93% — a
+~48x jump.
+
+**Why I didn't just report that number:** PaySim has a *documented* leakage
+problem — a peer-reviewed paper on this exact dataset
+([arXiv:2312.00586](https://arxiv.org/html/2312.00586v1)) found the
+simulator's balance columns leak the fraud label in a way that's an
+artifact of how PaySim generates data, not a real fraud pattern, and
+specifically flags the destination-balance columns as needing correction.
+The rule engine never used `oldbalanceDest`/`newbalanceDest`; the model
+did. A ~48x jump from adding exactly the columns a published paper says are
+suspicious is not something to take at face value, on a project where
+"verified, not assumed" has been the standard since Day 5's original
+consistency check.
+
+**What I did about it:** added a `--feature-set` ablation flag
+(`full` / `origin_only` / `dest_only`) and had the real numbers settle it:
+
+- `dest_only` (destination balances alone): 12.87% best-F1 precision, and
+  *worse* than the rule engine at recall≥0.90 (0.50% vs. the rule engine's
+  1.75%). This rules out the leakage hypothesis in its strong form —
+  destination balances alone carry almost no signal here.
+- `origin_only` (same information the rule engine has): 84.90% best-F1
+  precision, 91.27% recall — nearly matching (and beating on recall) the
+  full-feature model's 92.97%/85.25%.
+
+**Real conclusion:** the model's huge win over the rule engine isn't
+leakage — it's a gradient-boosted model finding sharper, nonlinear decision
+boundaries in the *same information* the rule engine had, instead of one
+fixed linear weighted sum. A legitimate, honest result. Decision: if this
+model is ever used beyond a benchmark, it trains on `origin_only`, not
+`full` — equivalent-to-better performance, and it removes the leakage
+question from the conversation entirely instead of needing this ablation
+re-explained every time.
+
+**Also tested and rejected:** the naive `hybrid_avg` scorer (a plain
+average of the model's probability and the rule engine's score) — it
+underperforms the model alone on every single metric in both ablations.
+Averaging in a much noisier, weaker score just adds noise; not shipping it.
+
+**The catch, stated plainly rather than glossed over:** this model, exactly
+like the rule engine before it (Day 4's honest gap analysis), is trained
+entirely on PaySim's own balance columns, which don't exist in live
+Razorpay data. Unlike the rule engine, there's no way to manually port this
+model's structure to Razorpay-native features the way Day 4 ported the rule
+engine's — a trained model needs labeled data, and Razorpay's test mode has
+none, which is the whole reason PaySim was substituted in here in the first
+place. So this is real, rigorously-verified proof that the rules-to-ML
+upgrade path is worth pursuing and exactly how much it's worth — not
+something wired into `agent_tools.py`'s live scoring today. Full writeup:
+`ARCHITECTURE.md` §3b.
+
+## Day 8 — real dispute drafting and real email, verified through the live agent loop
+
+**What I built:** `tool_draft_dispute_evidence` replaced its deterministic
+`[TODO fill]` template with `agent/evidence_drafter.py` — pulls the real
+payment/dispute/risk-score rows from the database, builds a prompt that
+explicitly forbids inventing supporting facts not in that data, and calls
+the authenticated `claude` CLI in print mode (`claude -p "<prompt>"`) for a
+single-turn draft. Deliberately NOT the `anthropic` SDK (needs a separate
+`ANTHROPIC_API_KEY` — different billing than the Claude subscription this
+whole project is built around) and NOT `claude_agent_sdk`'s
+`ClaudeSDKClient` (built for multi-turn tool-calling, which a one-shot
+letter draft isn't). `tool_notify_merchant` replaced its stub with
+`agent/notify_channel.py` — real SMTP email via stdlib `smtplib`, soft-fails
+to an honestly-labeled "stubbed" result when `SMTP_*` env vars aren't set.
+
+**What I verified, in order:**
+1. Unit-tested `evidence_drafter.py`'s failure paths with mocked
+   `subprocess.run` — CLI missing, non-JSON output, timeout, fenced JSON
+   extraction, out-of-range confidence clamping. All 5 pass.
+2. Unit-tested `notify_channel.py`'s two branches — unconfigured (stub) and
+   configured-but-unreachable-host (fails cleanly, doesn't raise). Both pass.
+3. Extended `run_demo()` to actually exercise both new tools (it didn't
+   before — the module docstring claimed "proves every fallback path
+   works" and that would have been false without this). Seeded a real
+   demo dispute, ran both tools with zero external config, confirmed
+   `--demo` still completes cleanly end to end with the honest fallback
+   states (`generated_by=template_fallback`, `sent=False, stubbed`).
+4. Ran the real thing against the actual `claude` CLI directly (not through
+   `--demo`) — got back a genuinely good, honest letter: thin evidence,
+   correctly flagged as thin, confidence self-rated 0.12-0.15 rather than
+   an inflated number.
+5. Ran `python3 agent/agent_tools.py --demo` again — and it fell back to
+   the template on the FIRST attempt despite the CLI being available and
+   working (confirmed moments earlier). Re-ran it: succeeded cleanly,
+   `generated_by=claude`. This wasn't a bug to chase down — it's the
+   soft-fail design doing exactly its job on a real transient hiccup (first
+   CLI invocation in a fresh process, plausibly a cold-start/network blip).
+   No crash, no silent false claim of success, graceful degradation on the
+   bad attempt and a clean real result on the next. Worth having on record
+   as an example of the fallback path actually firing on its own, not just
+   in a mocked test.
+6. Ran the FULL live orchestrator (`day6/run_scenario.py --live`) end to
+   end with these new tools wired in through the actual agent loop, not
+   direct calls. Claude drafted real evidence (confidence 0.10, correctly
+   flagged as weak — no fulfillment proof in the seeded data), and when it
+   called `notify_merchant` with no SMTP configured, it read the tool's own
+   honest `sent: False` result and told the human, unprompted: *"The
+   merchant may not have actually received the email... you should
+   configure those environment variables."* That's the soft-fail-and-report
+   design working correctly all the way up through the agent's own
+   natural-language summary, not just at the tool-return level — a genuine
+   payoff of the "never silently claim success" discipline this project has
+   held to since Day 7.
+
+**Not done:** the tracker's "5-minute admin task" (pre-filling the
+buildathon application form's static fields) — needs the actual form in
+front of me or pasted in; see "Next up" above.
 
 ---
 

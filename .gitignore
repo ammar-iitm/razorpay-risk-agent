@@ -22,5 +22,13 @@ data/*.zip
 # regenerable by running day5/evaluate.py, don't belong in git history)
 day5/pr_curve_results.csv
 
+# Trained model artifact (day5's stretch-goal classifier) — only produced
+# with --save-model, gitignored by default so an exploratory run doesn't
+# force a commit decision. If the real evaluation shows it's worth shipping
+# in the demo, it gets force-added deliberately (git add -f) with the
+# reasoning noted in BUILD_LOG.md, not picked up silently by a blanket
+# `git add`.
+day5/model.joblib
+
 # OS cruft
 .DS_Store

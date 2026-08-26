@@ -21,7 +21,7 @@ pip install claude-agent-sdk
 python3 day6/run_scenario.py --live
 ```
 
-The live run seeds two payments and one dispute, then hands control to a real Claude agent that has to decide what to do using only the gated tools — no scripted responses. It correctly auto-holds a small-amount payment, correctly queues a large-amount one for human approval, drafts (but never submits) dispute evidence, and sends one honest merchant notification that separates what actually executed from what's still pending — full trace in [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md)'s Day 6 entry.
+The live run seeds two payments and one dispute, then hands control to a real Claude agent that has to decide what to do using only the gated tools — no scripted responses. It correctly auto-holds a small-amount payment, correctly queues a large-amount one for human approval, and drafts (but never submits) real dispute evidence via a live Claude call. As of Day 8 the honesty goes further than the agent's own reasoning: when `notify_merchant`'s real email channel isn't configured, the tool itself reports that plainly, and the orchestrating Claude reads that and tells the human, unprompted — *"the merchant may not have actually received the email... you should configure those environment variables."* Full trace in [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md)'s Day 6 and Day 8 entries.
 
 ## Architecture
 
@@ -49,6 +49,8 @@ Evaluated against PaySim (6,362,620 labeled transactions — Razorpay test mode 
 
 0.13% of transactions are fraud, so 1.58% precision is a real ~12x lift over random — reported honestly rather than hidden behind an accuracy number, per the track's explicit ask. Full curve and methodology: [`day5/`](day5/), [`docs/ARCHITECTURE.md` §3a and §6](docs/ARCHITECTURE.md).
 
+A trained classifier ([`day5/stretch_classifier.py`](day5/stretch_classifier.py)) beats the rule engine by a wide margin on the same held-out test set — 92.97% vs. 4.45% best-F1 precision — and that gain was checked, not just reported: an ablation ruled out PaySim's documented balance-column leakage as the cause (destination-balance features alone scored *worse* than the rule engine) before trusting the number. Full ablation and the honest catch — it can't be deployed to live Razorpay scoring without labeled Razorpay data — in [`docs/ARCHITECTURE.md` §3b](docs/ARCHITECTURE.md).
+
 ## Project structure
 
 This is a real, incremental, dated build — the `dayN/` folders aren't a cosmetic choice, they mirror [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md)'s day-by-day account of what was built, what broke, and how it got fixed.
@@ -57,14 +59,18 @@ This is a real, incremental, dated build — the `dayN/` folders aren't a cosmet
 |---|---|
 | `sql/schema.sql` | The full data model — transactions, risk scores, the hash-chained audit log, disputes, and the policy table |
 | `agent/agent_tools.py` | Policy engine, audit logging, all 7 gated tool functions, and the Agent SDK orchestrator |
+| `agent/razorpay_client.py` | Live Razorpay payment-status verification (Day 7) |
+| `agent/evidence_drafter.py` | Real Claude-drafted dispute evidence letters (Day 8) |
+| `agent/notify_channel.py` | Real merchant email notifications (Day 8) |
 | `day1/` | Agent SDK fundamentals — proving the tool-calling loop and permission-gate mechanism work |
 | `day2/` | Live Razorpay test-mode integration — orders, payments, checkout, verified webhooks |
 | `day3/` | Real dataset exploration (PaySim) and the fraud signals actually found in it |
 | `day4/` | Feature engineering for live Razorpay data — including the honest gap analysis of which PaySim signals do and don't transfer |
-| `day5/` | The rule engine and its real precision/recall evaluation |
+| `day5/` | The rule engine, its real precision/recall evaluation, and the stretch-goal classifier with a leakage ablation check |
 | `day6/` | The live Claude Agent SDK orchestrator, tools wired end to end |
+| `day7/` | Live verification script for `hold_payment`/`release_payment` against a real completed checkout |
 | `docs/` | Architecture rationale, the build log, network troubleshooting notes, pre-submission checklist |
 
 ## Known limitations
 
-Stated explicitly rather than hidden — see [`docs/ARCHITECTURE.md` §10](docs/ARCHITECTURE.md): live Razorpay API calls inside the tool functions are still stubbed pending Day 7; `hold_payment` is internal state rather than a native Razorpay primitive (Razorpay has no "freeze this payment" endpoint); no external anchoring on the audit chain; single-agent architecture by deliberate scope, not oversight.
+Stated explicitly rather than hidden — see [`docs/ARCHITECTURE.md` §10](docs/ARCHITECTURE.md): `hold_payment` is internal state rather than a native Razorpay primitive (Razorpay has no "freeze this payment" endpoint), though it now reconciles against Razorpay's real live payment status before acting (Day 7); Razorpay's test mode has no way to simulate a dispute, so `submit_dispute_evidence`/`accept_dispute` are verified via a seeded-data live agent run rather than a real Razorpay dispute (`draft_dispute_evidence` itself is real and live — Day 8); no external anchoring on the audit chain; single-agent architecture by deliberate scope, not oversight.

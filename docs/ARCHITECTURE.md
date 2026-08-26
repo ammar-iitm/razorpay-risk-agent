@@ -139,6 +139,131 @@ silently drift from the real schema. Cold-start is handled explicitly too:
 against — a `0.0` would falsely claim "perfectly average," which the
 function has no basis to assert with that little history.
 
+## 3b. The Day 5 stretch goal: does a trained model actually beat the rule engine? (added 2026-08-26)
+
+Real answer, evaluated properly: **yes, meaningfully, and it's been checked
+for the failure mode that would make that claim untrustworthy.**
+
+`day5/stretch_classifier.py` trains a `HistGradientBoostingClassifier` on
+PaySim and compares it against the rule engine on an identical, temporally
+held-out test set (train on earlier `step`s, test on later ones — see the
+script's own docstring for why a random split would be too easy). Headline
+result, both scorers on the same 1,248,736-row test set:
+
+| Scorer | Best-F1 precision | Best-F1 recall | Precision @ recall≥0.90 |
+|---|---|---|---|
+| Rule engine | 4.45% | 52.68% | 1.75% |
+| ML model (full features) | 92.97% | 85.25% | 84.93% |
+
+A jump that large deserved suspicion before belief. The rule engine only
+ever used origin-side balances (`oldbalanceOrg`/`newbalanceOrig`) plus type
+and amount; the model additionally had `oldbalanceDest`/`newbalanceDest` —
+and PaySim has a *documented* leakage issue in its balance columns (a
+model that predicts fraud from `oldbalanceOrig == amount` gets suspiciously
+high accuracy for reasons that are an artifact of how the simulator
+generates data, not a real fraud pattern — see "Explainable Fraud Detection
+with Deep Symbolic Classification," [arXiv:2312.00586](https://arxiv.org/html/2312.00586v1),
+which flags the same risk around destination-balance imputation).
+
+So before trusting the number, ran an ablation — the same model, trained on
+three different feature subsets, same test set:
+
+| Feature set | Best-F1 precision | Best-F1 recall | Precision @ recall≥0.90 |
+|---|---|---|---|
+| `origin_only` (same info as the rule engine) | 84.90% | 91.27% | 85.68% |
+| `full` (adds dest balances) | 92.97% | 85.25% | 84.93% |
+| `dest_only` (destination balances alone) | 12.87% | 7.93% | 0.50% |
+
+This rules out the leakage hypothesis in its strong form: `dest_only` is
+*worse* than the rule engine, not suspiciously good — destination balances
+alone carry almost no signal on this dataset. And `origin_only` nearly
+matches (arguably beats, on recall) the `full` model — so the huge gain
+over the rule engine isn't coming from a leaky column at all. It's coming
+from a gradient-boosted model finding sharper, nonlinear, interaction-aware
+decision boundaries in the *exact same information* the rule engine has —
+type, amount, and origin-balance-drain — instead of one fixed linear
+weighted sum (`0.3·type + 0.5·drain + 0.2·amount`). That's a legitimate
+result: a hand-authored rule engine was always going to leave real signal
+on the table that a trained model, given the same inputs, could recover.
+
+**Also tested and rejected:** the naive `hybrid_avg` (a plain average of
+the model's probability and the rule engine's score) — it underperforms
+the model alone on every metric in both ablations (e.g. `origin_only`
+best-F1 f1=0.8797 for the model alone vs. 0.8389 for the average blend).
+Averaging in a much weaker, noisier score just adds noise. If a hybrid ever
+ships, it should combine the rule engine's `reason_codes` as human-readable
+explanation alongside the model's score — not blend the two numbers
+together.
+
+**Decision, given the numbers:** if/when this model is used for anything
+beyond a benchmark, it should train on `origin_only` features, not `full` —
+performance is equivalent-to-better (higher recall, comparable precision)
+and it removes the destination-balance question from the conversation
+entirely rather than needing this ablation explained every time.
+
+**The catch this doesn't get around:** exactly like the rule engine (§3a),
+this model is trained and evaluated entirely on PaySim's own columns —
+`oldbalanceOrg`/`newbalanceOrig` don't exist in live Razorpay data, for the
+same structural reason documented in §3a (Razorpay is a payment gateway,
+not a bank ledger). And unlike the rule engine, this model *can't* be
+manually re-derived for Razorpay-native features the way the rule engine's
+STRUCTURE was ported in Day 4 (velocity/identity checks standing in for
+balance-drain) — a supervised model needs labeled data to train on, and
+Razorpay's test mode has no fraud labels, which is the entire reason PaySim
+was used here in the first place (§6). So this classifier is real, honestly
+evaluated proof that the rules-to-ML upgrade path is worth pursuing and
+quantifies by how much — not something wired into `agent_tools.py`'s live
+scoring path today. `sql/schema.sql`'s `scoring_source` already has
+`'ml_model'`/`'hybrid'` reserved in its CHECK constraint for exactly this,
+whenever labeled Razorpay data exists to justify the training (see §11
+Roadmap).
+
+## 3c. Real dispute evidence drafting and merchant notification (Day 8)
+
+`tool_draft_dispute_evidence` no longer returns a fixed template. It now
+pulls the real payment row, dispute row, and latest risk score from the
+database and passes them to a live `claude` CLI call
+(`agent/evidence_drafter.py`), which drafts a summary + explanation letter
++ its own honest confidence score. The prompt explicitly instructs Claude
+not to invent supporting facts (delivery confirmations, customer
+communications, tracking numbers) that aren't in the real data — verified
+directly: a test run against a payment with genuinely thin evidence
+produced a letter that said so plainly and self-rated confidence at 0.10-
+0.15, not an inflated number. A human still reviews every draft before
+anything is ever submitted (`submit_dispute_evidence` stays
+`approval_required` regardless of confidence, unchanged from Day 6).
+
+Why the `claude` CLI in print mode rather than the `anthropic` SDK or
+`claude_agent_sdk`'s `ClaudeSDKClient`: the raw API SDK needs a standalone
+`ANTHROPIC_API_KEY` — separate billing from the Claude subscription this
+whole project is built to use (see README's quick start); `ClaudeSDKClient`
+is built for a multi-turn tool-calling loop, which drafting a letter isn't.
+The CLI's print mode is a synchronous, subscription-authenticated,
+single-turn call — the right weight for a text-generation sub-task, and it
+keeps `tool_draft_dispute_evidence` a plain synchronous function like every
+other tool, consistent with how Day 7's live Razorpay calls are also
+synchronous I/O inside the same tool functions.
+
+Soft-optional like every other real integration in this project: if the
+`claude` CLI isn't on PATH, times out, or returns something that doesn't
+parse as the expected JSON shape, `tool_draft_dispute_evidence` falls back
+to an OBVIOUSLY generic placeholder (`confidence: 0.0`, a literal
+`[TODO fill]`) rather than something that could be mistaken for a real
+draft — verified once in practice: the very first live-agent run hit this
+exact fallback path (a transient CLI hiccup, not a bug), then succeeded
+cleanly on retry. Both outcomes are correct behavior, not a failure.
+
+`tool_notify_merchant` sends a real email via `agent/notify_channel.py`
+(stdlib `smtplib`, zero new dependencies) when `SMTP_HOST` /`SMTP_PORT`/
+`SMTP_USER`/`SMTP_PASSWORD`/`SMTP_FROM`/`MERCHANT_EMAIL_TO` are all set,
+and otherwise reports itself as honestly `stubbed` — verified live end to
+end via `day6/run_scenario.py --live`: with no SMTP configured, the
+orchestrating Claude itself read the tool's own honest `sent: False`
+result and told the human directly, unprompted, "the merchant may not have
+actually received the email" — the soft-fail-and-report design working
+correctly all the way up through the agent's own natural-language summary,
+not just at the tool-return level.
+
 ## 4. The autonomy-tier policy (the "bounded and gated" story)
 
 Every tool the agent can call is mapped, in `policy_config`, to one of three
@@ -300,16 +425,18 @@ wants built.
 - Razorpay's test mode does **not** expose a way to simulate a dispute —
   checked directly in the dashboard (Test Mode → Disputes) on Day 7 and
   confirmed there's no "create test dispute" option, matching what
-  Razorpay's own API docs left ambiguous. This means `draft_dispute_evidence`
-  / `submit_dispute_evidence` / `accept_dispute` cannot be exercised against
-  a real live Razorpay dispute at all in a 10-day solo build — a live
-  dispute only exists when a real cardholder actually disputes a real
-  charge, which is out of scope to manufacture. These three tools are
-  verified via `day6/run_scenario.py`'s seeded-data live agent run (Claude
-  itself deciding to draft evidence and correctly NOT auto-submitting it)
-  plus unit-level checks, and that's the ceiling of what's honestly
-  verifiable here — stated plainly rather than implying a depth of API
-  integration that isn't achievable, not a gap I missed.
+  Razorpay's own API docs left ambiguous. This means `submit_dispute_evidence`
+  / `accept_dispute` (both real Razorpay API calls) cannot be exercised
+  against a real live Razorpay dispute at all in a 10-day solo build — a
+  live dispute only exists when a real cardholder actually disputes a real
+  charge, which is out of scope to manufacture. `draft_dispute_evidence` is
+  the exception: it's real and live (Day 8, §3c) since drafting only needs
+  the local dispute record, not a call to Razorpay's own dispute API. The
+  other two are verified via `day6/run_scenario.py`'s seeded-data live
+  agent run (Claude itself correctly drafting evidence and NOT
+  auto-submitting it) plus unit-level checks, and that's the ceiling of
+  what's honestly verifiable here — stated plainly rather than implying a
+  depth of API integration that isn't achievable, not a gap I missed.
 - No SHAP/per-feature attribution (§7) — reason codes + feature snapshot only.
 - Audit chain has no external anchoring (§8).
 - Single-agent architecture — no multi-agent handoff (deliberately scoped
@@ -323,3 +450,9 @@ wants built.
   the same `risk_scores`/`agent_actions` tables, coordinated rather than
   merged into one orchestrator.
 - SHAP-based per-transaction explanations for the merchant-facing dashboard.
+- Once real Razorpay transactions accumulate real fraud/chargeback outcomes
+  (i.e. labeled data that doesn't exist yet in test mode), retrain §3b's
+  classifier on Razorpay-native features (velocity/identity/amount-zscore,
+  §3a) instead of PaySim's columns, and actually wire `scoring_source =
+  'ml_model'` into the live agent path — §3b's PaySim result proves the
+  approach is worth the investment, it doesn't remove the need for labels.

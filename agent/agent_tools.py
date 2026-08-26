@@ -1,22 +1,40 @@
 """
-agent_tools.py — Risk Manager agent skeleton for the Razorpay AI Buildathon.
+agent_tools.py — Risk Manager agent for the Razorpay AI Buildathon.
 
-What's REAL and runs right now, no API key needed:
-  - SQLite schema wiring (sql/schema.sql)
-  - Hash-chained audit log (log_agent_action / verify_audit_chain)
-  - Policy evaluation engine (evaluate_policy) reading policy_config
-  - All 7 tool EXECUTION functions and the gating logic around them
-  - `python agent_tools.py --demo` runs a full scripted scenario end to end
-    and prints the resulting audit trail + a tamper-detection proof
+Status as of Day 8 (2026-08-26) — everything below is real, not a stub,
+each soft-failing to an honestly-labeled fallback when its optional
+dependency isn't configured, rather than crashing OR silently pretending
+to be live when it isn't:
 
-What's a STUB (clearly marked TODO) because it needs your Razorpay test
-keys and the actual Claude Agent SDK agent loop:
-  - The Razorpay API calls inside each tool (currently no-ops / mocked returns)
-  - `run_agent()` — wires everything into ClaudeSDKClient so Claude itself
-    decides which tool to call, in natural language, from a transaction feed
+  - SQLite schema wiring (sql/schema.sql), hash-chained audit log
+    (log_agent_action / verify_audit_chain), and the policy engine
+    (evaluate_policy reading policy_config) — always-on, zero dependencies.
+  - All 7 tool EXECUTION functions, each gated through evaluate_policy() —
+    exactly one implementation of the policy logic, called directly by
+    tests/demos or via run_agent()'s live SDK tool wrappers.
+  - tool_hold_payment / tool_release_payment fetch LIVE Razorpay payment
+    status via agent/razorpay_client.py (Day 7) before acting — soft-fails
+    to "skip live verification" without RAZORPAY_KEY_ID/SECRET configured.
+  - tool_draft_dispute_evidence drafts REAL evidence letters via a live
+    `claude` CLI call through agent/evidence_drafter.py (Day 8) — soft-fails
+    to an obviously-generic placeholder template (never a fabricated-looking
+    fallback) if the CLI isn't available.
+  - tool_notify_merchant sends a REAL email via agent/notify_channel.py
+    (Day 8, stdlib smtplib) — soft-fails to an honestly-reported "stubbed"
+    state without SMTP_* env vars configured.
+  - run_agent() — a live Claude Agent SDK loop (Day 6) deciding which of
+    the 7 tools to call, gated by the same policy engine either way.
+  - `python agent_tools.py --demo` runs a full scripted scenario with ZERO
+    external dependencies configured (proving every fallback path above
+    actually works, not just the happy path) and prints the resulting
+    audit trail + a tamper-detection proof.
 
-Fill in the TODOs on Day 4 (agent wiring) and Day 6 (real Razorpay calls) of
-the build tracker. Everything else here is meant to be used as-is.
+Real open limitation, stated here rather than glossed over: whether
+Razorpay's test mode supports SIMULATING a dispute at all is unconfirmed —
+checked directly, no such option exists in the dashboard (docs/BUILD_LOG.md,
+Day 7). So submit_dispute_evidence/accept_dispute are verified via
+day6/run_scenario.py's live seeded-data agent run and unit-level checks,
+not against a real live Razorpay dispute — see docs/ARCHITECTURE.md §10.
 """
 
 from __future__ import annotations
@@ -42,6 +60,14 @@ try:
     import razorpay_client
 except ImportError:
     razorpay_client = None
+
+# Same soft-optional reasoning as razorpay_client above (Day 8): drafting
+# falls back to a deterministic template if the `claude` CLI isn't
+# available, and notifying falls back to an honest "stubbed" report if SMTP
+# isn't configured — either way agent_tools.py keeps working with zero
+# external dependencies for --demo.
+import evidence_drafter
+import notify_channel
 
 
 def get_conn() -> sqlite3.Connection:
@@ -299,29 +325,75 @@ def tool_release_payment(conn: sqlite3.Connection, payment_id: str, reason: str)
     return result
 
 
+def _template_evidence_draft(dispute: dict) -> dict:
+    """Fallback used ONLY when a real Claude draft isn't available (CLI
+    missing, timed out, or returned something unparseable) — deliberately
+    kept obviously generic (the literal '[TODO fill]') rather than made to
+    look convincing, so a human reviewer can never mistake a fallback
+    template for a real drafted letter."""
+    return {
+        "summary": f"Evidence package for dispute {dispute.get('dispute_id')}",
+        "explanation_letter": (
+            f"Payment {dispute.get('payment_id') or '?'} was authorized and delivered per standard "
+            f"process; reason code {dispute.get('reason_code') or 'unknown'} is disputed on these grounds: [TODO fill]."
+        ),
+        "confidence": 0.0,
+    }
+
+
 def tool_draft_dispute_evidence(conn: sqlite3.Connection, dispute_id: str) -> dict:
     # Always auto — drafting has no money_impact (see tools_schema.json).
-    dispute = conn.execute(
-        "SELECT payment_id, reason_code, amount FROM disputes WHERE dispute_id = ?", (dispute_id,)
+    dispute_row = conn.execute(
+        "SELECT payment_id, reason_code, amount, respond_by FROM disputes WHERE dispute_id = ?", (dispute_id,)
     ).fetchone()
-    # TODO (Day 7): replace this template with an actual LLM call (Claude)
-    # that pulls payment metadata + a policy/evidence template and drafts
-    # summary + explanation_letter. Kept deterministic here for the demo.
-    draft = {
-        "summary": f"Evidence package for dispute {dispute_id}",
-        "explanation_letter": (
-            f"Payment {dispute[0] if dispute else '?'} was authorized and delivered per standard "
-            f"process; reason code {dispute[1] if dispute else 'unknown'} is disputed on these grounds: [TODO fill]."
-        ),
-        "confidence": 0.5,
+    dispute = {
+        "dispute_id": dispute_id,
+        "payment_id": dispute_row[0] if dispute_row else None,
+        "reason_code": dispute_row[1] if dispute_row else None,
+        "amount": dispute_row[2] if dispute_row else None,
+        "respond_by": dispute_row[3] if dispute_row else None,
     }
+
+    payment = {}
+    if dispute["payment_id"]:
+        p = conn.execute(
+            "SELECT payment_id, amount, currency, method, status, captured, email, contact "
+            "FROM transactions WHERE payment_id = ?", (dispute["payment_id"],)
+        ).fetchone()
+        if p:
+            payment = dict(zip(["payment_id", "amount", "currency", "method", "status", "captured", "email", "contact"], p))
+    risk = latest_risk_score(conn, dispute["payment_id"]) if dispute["payment_id"] else None
+
+    draft = None
+    generated_by = "template_fallback"
+    fallback_reason = None
+    if not evidence_drafter.claude_cli_available():
+        fallback_reason = "claude CLI not found on PATH"
+    else:
+        prompt = evidence_drafter.build_prompt(payment, dispute, risk)
+        draft = evidence_drafter.draft_with_claude(prompt)
+        if draft is None:
+            fallback_reason = "claude CLI call failed, timed out, or returned unparseable output"
+
+    if draft is None:
+        draft = _template_evidence_draft(dispute)
+    else:
+        generated_by = "claude"
+    draft["generated_by"] = generated_by
+
     conn.execute("UPDATE disputes SET evidence_draft = ? WHERE dispute_id = ?", (json.dumps(draft), dispute_id))
     conn.commit()
+
+    if generated_by == "claude":
+        reasoning = "Drafted via a live Claude call using real payment/dispute context from the database. No money impact; always auto-allowed. A human must review before any submission."
+    else:
+        reasoning = f"Fell back to the deterministic placeholder template ({fallback_reason}) — this draft is NOT real evidence content and must not be submitted as-is. No money impact; always auto-allowed."
+
     action_id = log_agent_action(
-        conn, payment_id=dispute[0] if dispute else None, dispute_id=dispute_id,
+        conn, payment_id=dispute["payment_id"], dispute_id=dispute_id,
         action_type="draft_dispute_evidence", decision_tier="auto_executed",
-        risk_score_at_decision=None, policy_rule_applied="draft_evidence_always",
-        agent_reasoning="Evidence drafting has no money impact; always auto-allowed.",
+        risk_score_at_decision=risk["score"] if risk else None, policy_rule_applied="draft_evidence_always",
+        agent_reasoning=reasoning,
         tool_input={"dispute_id": dispute_id}, tool_output=draft, actor="agent",
     )
     draft["agent_action_id"] = action_id
@@ -363,12 +435,25 @@ def tool_accept_dispute(conn: sqlite3.Connection, dispute_id: str, reason: str) 
 
 
 def tool_notify_merchant(conn: sqlite3.Connection, payment_id: str, message: str) -> dict:
-    # TODO (Day 8): actually send via WhatsApp/email provider.
-    result = {"status": "sent", "payment_id": payment_id}
+    # Day 8: real email via agent/notify_channel.py, soft-fails to an
+    # honestly-labeled "stubbed" state if SMTP isn't configured — see that
+    # module's docstring for why email over WhatsApp.
+    send_result = notify_channel.send_merchant_email(
+        subject=f"Risk agent notification — payment {payment_id}", body=message,
+    )
+    # tools_schema.json's output_schema only allows status="sent" (drafting
+    # a stricter enum wasn't worth a schema change for this) — the real
+    # outcome (whether an email actually went out) lives in send_result,
+    # not hidden, just not squeezed into that one field.
+    result = {"status": "sent", "payment_id": payment_id, **send_result}
+    reasoning = (
+        f"Informational only, no money impact. Email {'sent' if send_result['sent'] else 'NOT sent'} "
+        f"({send_result['detail']})."
+    )
     action_id = log_agent_action(
         conn, payment_id=payment_id, dispute_id=None, action_type="notify_merchant",
         decision_tier="auto_executed", risk_score_at_decision=None,
-        policy_rule_applied="notify_merchant_always", agent_reasoning="Informational only, no money impact.",
+        policy_rule_applied="notify_merchant_always", agent_reasoning=reasoning,
         tool_input={"payment_id": payment_id, "message": message}, tool_output=result, actor="agent",
     )
     result["agent_action_id"] = action_id
@@ -539,6 +624,11 @@ def run_demo() -> None:
         "INSERT INTO risk_scores (payment_id, score, model_version, reason_codes, feature_snapshot, scoring_source) "
         "VALUES ('pay_demo_high', 0.91, 'hybrid-v0.1', '[\"velocity_high\",\"amount_outlier\"]', '{}', 'hybrid')"
     )
+    conn.execute(
+        "INSERT INTO disputes (dispute_id, payment_id, amount, currency, reason_code, phase, status, respond_by, razorpay_created_at) "
+        "VALUES ('disp_demo_1', 'pay_demo_mid', 50000, 'INR', 'goods_services_not_provided', 'chargeback', 'open', ?, ?)",
+        (now + 7 * 86400, now),
+    )
     conn.commit()
 
     print("--- Mid risk (0.85), small amount (Rs.500): expect auto_executed ---")
@@ -551,6 +641,17 @@ def run_demo() -> None:
     print("    'auto' rule in policy_config, so it correctly fails safe to approval_required")
     print("    rather than silently defaulting to allow. This is intentional -- see")
     print("    evaluate_policy()'s fail-safe default and ARCHITECTURE.md.")
+
+    print("\n--- Drafting dispute evidence (Day 8: real Claude call if the CLI is available, "
+          "an obviously-generic placeholder otherwise -- either way, never a crash) ---")
+    draft = tool_draft_dispute_evidence(conn, "disp_demo_1")
+    print(f"generated_by={draft['generated_by']}  confidence={draft['confidence']}")
+    print(f"summary: {draft['summary']}")
+
+    print("\n--- Notifying merchant (Day 8: real email if SMTP_* is configured, "
+          "an honestly-reported 'stubbed' result otherwise) ---")
+    notify = tool_notify_merchant(conn, "pay_demo_mid", "Your payment was placed on hold pending review.")
+    print(f"sent={notify['sent']}  detail={notify['detail']}")
 
     print("\n--- Verifying audit chain integrity ---")
     ok, bad_id = verify_audit_chain(conn)
