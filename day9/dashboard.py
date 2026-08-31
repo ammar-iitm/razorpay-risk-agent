@@ -107,6 +107,18 @@ BASE_HTML = """
   .bar-track { flex: 1; background: rgba(139,146,163,0.12); border-radius: 4px; height: 16px; position: relative; }
   .bar-fill { background: var(--accent); border-radius: 4px; height: 100%; }
   .bar-val { width: 60px; text-align: right; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .chain-strip { display: flex; align-items: center; overflow-x: auto; padding: 4px 2px 10px; }
+  .chain-block { flex-shrink: 0; width: 58px; height: 58px; border-radius: 8px; border: 2px solid;
+                 display: flex; flex-direction: column; align-items: center; justify-content: center;
+                 font-family: ui-monospace, monospace; cursor: default; }
+  .chain-block .chain-id { font-size: 10px; color: var(--muted); }
+  .chain-block .chain-hash { font-size: 11px; font-weight: 700; margin-top: 2px; }
+  .chain-block.ok { background: rgba(46,160,67,0.12); border-color: rgba(46,160,67,0.45); }
+  .chain-block.ok .chain-hash { color: #56d364; }
+  .chain-block.broken { background: rgba(218,54,51,0.14); border-color: #f85149; }
+  .chain-block.broken .chain-hash { color: #f85149; }
+  .chain-link { flex-shrink: 0; width: 18px; height: 2px; background: var(--border); }
+  .chain-link.broken { background: #f85149; height: 3px; }
 </style>
 </head>
 <body>
@@ -172,6 +184,17 @@ what the agent decided) — use it if a row's Hold state ever looks out of step 
 decision, e.g. after a schema repair on an older db file.</div>
 
 {% if rows %}
+<div class="panel">
+<div class="grid2">
+  <div><div class="stat num">{{ stats.total }}</div><div class="stat-label">Transactions</div></div>
+  <div><div class="stat num">{{ stats.on_hold_count }}</div><div class="stat-label">Currently on hold</div></div>
+  <div><div class="stat num">Rs {{ "{:,}".format(stats.on_hold_value) }}</div><div class="stat-label">Value on hold</div></div>
+  <div><div class="stat num">{{ stats.queued_count }}</div><div class="stat-label">Queued for human review</div></div>
+</div>
+<div class="note">Every number above is computed from the same rows in the table below — nothing
+here is a separate query that could drift from what's actually shown.</div>
+</div>
+
 <div class="panel">
 <table>
 <tr><th>Payment</th><th>Amount</th><th>Status</th><th>Risk</th><th>Reason codes</th><th>Hold</th><th>Last agent decision</th></tr>
@@ -318,10 +341,24 @@ def backfill_hold_state(conn) -> int:
     return cur.rowcount
 
 
+def feed_stats(rows: list[dict]) -> dict:
+    """Every number here is derived from the exact same `rows` the table
+    renders, not a second query -- so the stats strip can never show a
+    different picture than the table underneath it. Kept as a plain
+    function (not inline in the template) so it's testable on its own."""
+    on_hold_rows = [r for r in rows if r["on_hold"]]
+    return {
+        "total": len(rows),
+        "on_hold_count": len(on_hold_rows),
+        "on_hold_value": sum(r["amount"] for r in on_hold_rows) // 100,  # paise -> Rs
+        "queued_count": sum(1 for r in rows if r["decision_tier"] == "queued_for_approval"),
+    }
+
+
 @app.route("/")
 def live_feed():
     if not os.path.exists(agent_tools.DB_PATH):
-        return render("Live feed", "feed", render_template_string(FEED_BODY, rows=[], risk_chip=risk_chip, tier_chip=tier_chip))
+        return render("Live feed", "feed", render_template_string(FEED_BODY, rows=[], stats=feed_stats([]), risk_chip=risk_chip, tier_chip=tier_chip))
     conn = agent_tools.get_conn()
     missing = schema_mismatch_column(conn)
     if missing:
@@ -344,7 +381,7 @@ def live_feed():
             "policy_rule_applied": last_action[1] if last_action else None,
         })
     conn.close()
-    body = render_template_string(FEED_BODY, rows=rows, risk_chip=risk_chip, tier_chip=tier_chip)
+    body = render_template_string(FEED_BODY, rows=rows, stats=feed_stats(rows), risk_chip=risk_chip, tier_chip=tier_chip)
     return render("Live feed", "feed", body)
 
 
@@ -420,6 +457,22 @@ Tamper with any row and every row after it provably breaks — that's what the b
   {% endif %}
 {% endif %}
 
+{% if chain_items %}
+<div class="chain-strip">
+{% for item in chain_items %}
+  <div class="chain-block {{ 'broken' if item.row.broken else 'ok' }}" title="row #{{ item.row.id }} — {{ item.row.action_type }}&#10;full hash: {{ item.row.this_hash }}">
+    <span class="chain-id">#{{ item.row.id }}</span>
+    <span class="chain-hash">{{ item.row.this_hash[:4] }}</span>
+  </div>
+  {% if not loop.last %}<div class="chain-link {{ 'broken' if item.link_broken else '' }}"></div>{% endif %}
+{% endfor %}
+</div>
+<div class="note">Each block is one <code>agent_actions</code> row, hover for its full hash. Green means its
+recomputed hash still matches what's stored; the moment tampering breaks one row, every block from there
+onward turns red — that's <code>verify_audit_chain()</code>'s own recomputation, drawn out block by block
+instead of just reported as a yes/no.</div>
+{% endif %}
+
 <div class="controls">
   <form class="inline" method="post" action="{{ url_for('tamper') }}">
     <button type="submit" class="danger">Tamper row 1 (demo)</button>
@@ -451,22 +504,41 @@ Tamper with any row and every row after it provably breaks — that's what the b
 """
 
 
+def chain_visual_items(rows: list[dict]) -> list[dict]:
+    """Builds the block-and-link data the chain-strip template loops over.
+    `row.broken` marks every row from the first mismatch onward (matching
+    verify_audit_chain()'s own "everything from that row onward is
+    untrusted" semantics, not just the single bad row); `link_broken`
+    marks the connector INTO the next block, so the link right before the
+    first broken block goes red too -- visually, that's exactly where the
+    chain actually breaks."""
+    items = []
+    for i, row in enumerate(rows):
+        next_broken = rows[i + 1]["broken"] if i + 1 < len(rows) else False
+        items.append({"row": row, "link_broken": next_broken})
+    return items
+
+
 @app.route("/audit")
 def audit():
     if not os.path.exists(agent_tools.DB_PATH):
         return render("Audit trail", "audit", render_template_string(
-            AUDIT_BODY, rows=[], intact=None, bad_row=None, row_count=0, tier_chip=tier_chip))
+            AUDIT_BODY, rows=[], chain_items=[], intact=None, bad_row=None, row_count=0, tier_chip=tier_chip))
     conn = agent_tools.get_conn()
     intact, bad_row = agent_tools.verify_audit_chain(conn)
     rows = [
-        {"id": r[0], "action_type": r[1], "decision_tier": r[2], "policy_rule_applied": r[3], "agent_reasoning": r[4], "this_hash": r[5]}
+        {"id": r[0], "action_type": r[1], "decision_tier": r[2], "policy_rule_applied": r[3], "agent_reasoning": r[4], "this_hash": r[5],
+         "broken": bad_row is not None and r[0] >= bad_row}
         for r in conn.execute(
             "SELECT id, action_type, decision_tier, policy_rule_applied, agent_reasoning, this_hash "
             "FROM agent_actions ORDER BY id ASC"
         ).fetchall()
     ]
     conn.close()
-    body = render_template_string(AUDIT_BODY, rows=rows, intact=intact, bad_row=bad_row, row_count=len(rows), tier_chip=tier_chip)
+    body = render_template_string(
+        AUDIT_BODY, rows=rows, chain_items=chain_visual_items(rows),
+        intact=intact, bad_row=bad_row, row_count=len(rows), tier_chip=tier_chip,
+    )
     return render("Audit trail", "audit", body)
 
 

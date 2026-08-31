@@ -44,11 +44,11 @@ The live run seeds two payments and one dispute, then hands control to a real Cl
 
 Real screenshots of the dashboard above, running against real (seeded) data — nothing staged or mocked up for this README.
 
-**Live feed** — policy-gated decisions as they happen: a small-amount payment auto-held, a large-amount one queued for human approval.
+**Live feed** — policy-gated decisions as they happen: a small-amount payment auto-held, a large-amount one queued for human approval, and a stats strip (transactions, currently on hold, Rs value on hold, queued for human review) computed from the exact same rows the table below it shows — not a second query that could drift.
 
 ![Live feed](docs/screenshots/live_feed.png)
 
-**Audit trail** — every action hash-chained, with a live tamper-check banner and the real reasoning text behind each decision.
+**Audit trail** — every action hash-chained, with a live tamper-check banner and a block-by-block chain visualization: green while every recomputed hash matches, and the moment one row is tampered, that block and every block after it turns red — `verify_audit_chain()`'s own recomputation, drawn out instead of just reported as a yes/no.
 
 ![Audit trail](docs/screenshots/audit_trail.png)
 
