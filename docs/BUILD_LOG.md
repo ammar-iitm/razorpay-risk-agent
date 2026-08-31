@@ -904,3 +904,98 @@ probably why they were worth finding: a "never crash, always report
 honestly" pledge is only as real as the code paths that were actually
 tested against it, and two of the eight tool-call paths in this codebase
 hadn't been, until today.
+
+## Day 10 (continued) — "test it on maximum edge cases": four more real bugs
+
+Asked to go further than the first Day-10 pass, so this was a genuinely
+broad sweep rather than a couple of spot checks: wrote
+`day10/edge_case_tests.py`, a real, runnable script (not a list of
+things I reasoned about) that executes 23 cases straight against
+`agent_tools.py`'s real functions on a scratch database — negative /
+zero / absurdly large amounts, empty / `None` / SQL-injection-shaped /
+100,000-character / emoji `payment_id`s, calling `hold_payment` twice on
+the same payment, releasing something never held, accepting the same
+dispute twice, submitting evidence that was never drafted, an
+XSS-shaped `reason` string, an empty audit chain, a single-row audit
+chain, tampering the last row vs. a middle row, and four policy-boundary
+cases (`risk_score` exactly `0.8`, just under it, `amount` exactly
+`1,000,000`, and `1,000,001`). All 23 passed outright — the FK guards
+and fail-safe defaults from the first Day-10 pass really do hold up
+under a much wider net, and that's worth stating plainly rather than
+padding this log with a bug that didn't happen.
+
+The genuinely new findings came from two places the script above
+doesn't reach: the Flask routes themselves.
+
+**`day2/webhook_listener.py`: two more ways a signed body crashes the
+route, both distinct from the malformed-JSON fix earlier this build.**
+Threw a battery of signed-but-hostile bodies at the real `/webhook`
+route through Flask's test client:
+
+1. A body that's valid JSON but not a JSON *object* — `[1,2,3]`, a bare
+   number, a bare string, `null` — all parse cleanly, so the existing
+   `except json.JSONDecodeError` never fires, and then
+   `payload.get("event")` blows up with `AttributeError: 'list' object
+   has no attribute 'get'` (or `'int'`, `'str'`, `'NoneType'`). Razorpay's
+   real webhooks are always a JSON object; anything else was never a
+   real event to begin with.
+2. A body of genuine binary garbage (`\xff\xfe\x00\x01...`) isn't caught
+   by `except json.JSONDecodeError` either — `json.loads()` tries to
+   auto-detect a text encoding from raw bytes before it even gets to
+   parsing JSON, and on bytes that aren't valid text in any encoding it
+   tries, it raises `UnicodeDecodeError` instead. A completely different
+   exception type the original fix didn't anticipate, because the
+   earlier bug was found with a body that *was* valid UTF-8 text, just
+   not valid JSON.
+
+Both are the same retry-forever risk as the first webhook fix: a non-2xx
+response makes Razorpay's real delivery retry indefinitely. Fixed by
+widening the except clause to `(json.JSONDecodeError,
+UnicodeDecodeError)` and adding an explicit `isinstance(payload, dict)`
+check right after parsing, both returning a clean `400`. Re-ran the full
+battery (9 cases, including a wrong-signature control to confirm the
+signature check still runs first) against the fixed route: every
+malformed case now gets a clean `400`, every well-formed case still gets
+`200`.
+
+**`day9/dashboard.py`: a realistic two-click sequence that corrupts the
+db file and then crashes a second route.** `FEED_BODY`'s "Sync hold
+state from audit log" button and `AUDIT_BODY`'s "Tamper row 1 (demo)"
+button are both permanently visible, regardless of whether "Seed demo
+data" has ever been clicked — nothing hides them on a brand-new page.
+Clicking "Sync hold state" as literally the first thing on a fresh page
+hit `sqlite3.OperationalError: no such table: transactions`, because
+`repair_schema()` assumed a `transactions` table already existed and
+just needed a column added; there was no table at all. Worse:
+`agent_tools.get_conn()` calls `sqlite3.connect(DB_PATH)`, and SQLite
+creates an empty file just from connecting to a path that doesn't exist
+yet — so that one crashed click left a stray, tableless `risk_agent.db`
+sitting on disk. Every other route in this app decides "does real data
+exist here?" by checking `os.path.exists(DB_PATH)`, which was now
+lying: the file existed, but nothing was in it. Clicking "Tamper row 1"
+next (again, a completely reasonable thing for a first-time visitor to
+try) passed that existence check and then crashed on
+`sqlite3.OperationalError: no such table: agent_actions`.
+
+Reproduced the exact click order (`GET /` → `POST /repair` → `GET /` →
+`GET /audit` → `POST /tamper`) against a totally fresh scratch db
+through Flask's test client and watched both crashes happen for real,
+in that order, before touching any fix. Fixed `/repair` to check
+`os.path.exists(DB_PATH)` itself and call `init_db(fresh=True)` when
+there's genuinely nothing to repair, instead of attempting an `ALTER
+TABLE` against a table that doesn't exist. Fixed `/tamper` to check
+`sqlite_master` for `agent_actions` actually existing, rather than
+trusting file-existence as a proxy for "real data is here" — the exact
+assumption the first bug broke. Re-ran the identical click sequence
+against the fixed routes (still zero seed data anywhere): every step
+now returns cleanly, and a full normal-flow regression right after
+(seed → live feed shows both rows → audit chain intact → tamper → audit
+chain correctly shows BROKEN → repair on an already-current schema is
+still a safe no-op → metrics still renders) came back clean too.
+
+Re-ran the original Day-10 six-tool FK fix, `--demo`, and the new
+23-case script one more time after all four fixes above — nothing
+regressed. `day10/edge_case_tests.py` stays in the repo as a real,
+re-runnable artifact, not a one-time scratch script: a claim of "tested
+extensively" that a reader can't re-run themselves is a weaker claim
+than one they can.

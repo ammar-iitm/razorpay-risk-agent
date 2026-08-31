@@ -69,6 +69,46 @@ Three passes on one bug, each only caught by checking real data against
 the previous fix rather than assuming it was correct because it stopped
 the crash. (Day 9)
 
+**A signed webhook body that's valid JSON but not a JSON object crashed
+the route.** `[1,2,3]`, a bare number, a bare string, and `null` all
+parse cleanly under `json.loads()`, so they sailed past the malformed-JSON
+fix above — then `payload.get("event")` threw `AttributeError` because
+none of those types have a `.get()` method. A body of genuine binary
+garbage crashed differently again: `json.loads()` tries to auto-detect a
+text encoding before it parses, and raised `UnicodeDecodeError`, not
+`JSONDecodeError`, on bytes that aren't valid text at all — a second
+exception type the original `except` clause didn't catch. Found by
+throwing a battery of signed-but-hostile bodies at the real `/webhook`
+route through Flask's test client, split out specifically because a
+correct signature doesn't come with any guarantee about what shape the
+underlying JSON takes. Fixed by widening the except clause to catch both
+exception types and adding an explicit `isinstance(payload, dict)` check
+after parsing — both paths now return a clean `400` instead of a `500`,
+preserving the same "don't make Razorpay retry forever" reasoning as the
+first webhook fix. (Day 10, edge-case sweep)
+
+**Two dashboard buttons, always visible, chained into two crashes on a
+completely fresh page.** `/audit`'s "Tamper row 1" and the live feed's
+"Sync hold state from audit log" both render unconditionally, with no
+"seed data first" gate. Clicking "Sync hold state" before ever seeding
+crashed with `no such table: transactions` — `repair_schema()` assumed a
+`transactions` table already existed and just needed a column, but
+`sqlite3.connect()`'s own side effect (creating an empty file just by
+connecting to a path that doesn't exist) meant one crashed click left a
+stray, tableless db file on disk. Because every other route in the app
+uses `os.path.exists(DB_PATH)` as its signal for "real data is here,"
+that stray file made the next request lie: clicking "Tamper row 1" next
+passed the existence check and then crashed on `no such table:
+agent_actions`. Reproduced the exact two-click sequence against a fresh
+scratch db through Flask's test client before fixing anything. Fixed
+`/repair` to initialize a fresh, correctly-shaped db when none exists
+instead of attempting an `ALTER TABLE` with nothing to alter, and fixed
+`/tamper` to check `sqlite_master` for the table it actually needs
+rather than trusting file-existence as a stand-in. Re-ran the identical
+click sequence plus a full normal-flow regression (seed, view, tamper,
+verify-broken, repair-as-no-op, metrics) against the fix — clean
+throughout. (Day 10, edge-case sweep)
+
 **A stretch-goal file was built under the wrong day.** The Day 5 ML
 classifier was initially written and named as if it were Day 8 work,
 contradicting the actual build plan. Caught directly, not by me — fixed by

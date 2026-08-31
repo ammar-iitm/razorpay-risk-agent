@@ -375,6 +375,25 @@ def reset():
 
 @app.route("/repair", methods=["POST"])
 def repair():
+    # Day 10 edge-case pass: "Sync hold state from audit log" is a
+    # permanent button in FEED_BODY's controls, visible even on a totally
+    # fresh page before "Seed demo data" has ever been clicked — a
+    # perfectly reasonable first click for a curious visitor. Before this
+    # guard, that click hit sqlite3.connect()'s own side effect (it
+    # silently creates an empty file at DB_PATH just by connecting, even
+    # though nothing was ever initialized) followed by repair_schema()
+    # trying `ALTER TABLE transactions ADD COLUMN ...` against a table
+    # that was never created: `sqlite3.OperationalError: no such table:
+    # transactions`. Worse, that stray empty file then made every
+    # subsequent os.path.exists(DB_PATH) check across this whole app
+    # falsely look like "a real db is here" — see the /tamper fix below
+    # for the crash that caused downstream. There's nothing to repair
+    # when no db exists yet, so this just creates a correctly-shaped
+    # empty one instead of attempting an ALTER TABLE with no table to
+    # alter.
+    if not os.path.exists(agent_tools.DB_PATH):
+        agent_tools.init_db(fresh=True)
+        return redirect(url_for("live_feed"))
     conn = agent_tools.get_conn()
     repair_schema(conn)  # adds any missing columns; no-op if the schema's already current
     backfill_hold_state(conn)  # always re-derive on_hold/held_at from agent_actions — safe, idempotent,
@@ -453,10 +472,21 @@ def audit():
 
 @app.route("/tamper", methods=["POST"])
 def tamper():
+    # Day 10 edge-case pass: os.path.exists(DB_PATH) alone isn't proof the
+    # agent_actions table exists — sqlite3.connect() creates an empty file
+    # just by connecting to a path that doesn't exist yet (that's exactly
+    # how the /repair bug fixed above left a stray file sitting here
+    # before this fix existed), so a file being present doesn't guarantee
+    # any table was ever created in it. "Tamper row 1 (demo)" is, like
+    # /repair's button, permanently visible on /audit regardless of
+    # whether any data has been seeded, so checking the actual table list
+    # rather than trusting file existence is the honest guard here.
     if os.path.exists(agent_tools.DB_PATH):
         conn = agent_tools.get_conn()
-        conn.execute("UPDATE agent_actions SET agent_reasoning = ? WHERE id = 1", ("TAMPERED — this text was rewritten after the fact",))
-        conn.commit()
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "agent_actions" in tables:
+            conn.execute("UPDATE agent_actions SET agent_reasoning = ? WHERE id = 1", ("TAMPERED — this text was rewritten after the fact",))
+            conn.commit()
         conn.close()
     return redirect(url_for("audit"))
 
