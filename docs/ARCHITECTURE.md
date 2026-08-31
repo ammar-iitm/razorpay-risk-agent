@@ -264,6 +264,52 @@ actually received the email" — the soft-fail-and-report design working
 correctly all the way up through the agent's own natural-language summary,
 not just at the tool-return level.
 
+## 3d. The dashboard (Day 9)
+
+`day9/dashboard.py` is a single-file Flask app — Flask because it's
+already a proven dependency (Day 2's `webhook_listener.py`), not a new
+one, matching the tracker's explicit "keep the framework choice boring."
+One file on purpose: a judge should be able to read every route, query,
+and template in one place rather than hunt across a `templates/` folder.
+
+Three routes, one per judge-facing question this project exists to
+answer:
+
+- `/` (live feed) answers "what is the agent looking at right now?" —
+  real `transactions` rows joined against each payment's latest
+  `risk_scores` row and most recent `hold_payment`/`release_payment`
+  entry in `agent_actions`. Risk chips and reason codes render straight
+  from stored data, not a recomputed or summarized version of it.
+- `/audit` answers "can I trust the log?" — calls `verify_audit_chain()`
+  live on every page load and shows its real result in a banner. A
+  "Tamper row 1" button performs an actual `UPDATE` against
+  `agent_actions` and redirects back, so the chain-intact banner visibly
+  flips to chain-broken on the next load — the same proof `--demo` already
+  does at the CLI, now click-through for the pitch video.
+- `/metrics` answers "is the detector actually good, and what does that
+  cost?" — the rule engine's real PR curve, a back-calculated confusion
+  matrix and ₹ cost/value estimate at the shipped 0.8 threshold, and the
+  Day 5-stretch ablation table, all sourced in `day9/real_results.py`.
+
+Two honesty constraints carried over from the rest of the project:
+
+1. **No dashboard-only logic.** The "seed demo data" and reset buttons
+   call the exact same `seed_demo_scenario()` / `init_db()` /
+   `verify_audit_chain()` functions the CLI (`--demo`) and
+   `day6/run_scenario.py` already use — extracted from `run_demo()`
+   specifically so the dashboard couldn't end up with a second,
+   independently-drifting copy of "what the demo scenario is."
+2. **The metrics page is not a live re-scoring.** `day9/real_results.py`
+   holds baked-in numbers from real evaluation runs already documented in
+   §3a/§3b, with every number's source cited in the module's comments —
+   re-running `day5/evaluate.py` and `day5/stretch_classifier.py` against
+   the full 6.3M-row PaySim dataset per page load would take minutes, and
+   the dataset isn't shipped with the repo in the first place. The
+   confusion matrix shown is explicitly labeled as *back-calculated* from
+   the saved precision/recall rates and the real fraud count — the
+   original evaluation runs saved rates, not raw TP/FP/FN/TN counts — not
+   a second independent measurement.
+
 ## 4. The autonomy-tier policy (the "bounded and gated" story)
 
 Every tool the agent can call is mapped, in `policy_config`, to one of three
@@ -441,6 +487,25 @@ wants built.
 - Audit chain has no external anchoring (§8).
 - Single-agent architecture — no multi-agent handoff (deliberately scoped
   out for a solo 10-day build; see the buildathon strategy doc for why).
+- **No live webhook-to-database ingestion pipeline (checked directly, Day 10).**
+  `day2/webhook_listener.py` verifies a Razorpay webhook's signature and
+  prints the payload — it never writes to `transactions`. Every row that
+  exists in `transactions` today got there through a seed script
+  (`agent_tools.py`'s `--demo`, `day6/run_scenario.py`, the dashboard's
+  "Seed demo data"), each of which calls `init_db(fresh=True)` before
+  inserting. Two consequences worth stating plainly: first, a genuinely
+  live Razorpay integration that ingests real webhook events into this
+  schema is real future work, not a small gap — building it safely means
+  making the insert idempotent against Razorpay's own webhook retries
+  (`INSERT ... ON CONFLICT (payment_id) DO UPDATE`, keyed off Razorpay's
+  own delivery-id header) so a redelivered webhook updates the existing
+  row instead of erroring or double-counting. Second, because that
+  pipeline doesn't exist, "duplicate payment_id" isn't a live risk in this
+  build today — confirmed by testing a real duplicate `INSERT` against the
+  schema directly (`sqlite3.IntegrityError: UNIQUE constraint failed:
+  transactions.payment_id`), which is exactly the error an idempotent
+  ingestion path above would need to catch and convert into an update.
+  Full test detail: `docs/BUILD_LOG.md`'s Day 10 entry.
 
 ## 11. Roadmap if this became a real 6-12 month internship project
 

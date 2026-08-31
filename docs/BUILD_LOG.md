@@ -34,8 +34,24 @@ task" — pre-filling the static parts of the buildathon application form
 have the actual form in front of me; this needs you to either paste its
 fields or fill it directly when you have Razorpay's application open.
 
-**Next up: Day 9** (`artifact/tracker.html`'s plan — a browser-based
-dashboard, "the biggest remaining day").
+**Status as of 2026-08-26 (later still): Day 9 is done — the browser
+dashboard exists, runs, and every route was hit and checked, not just
+written.** `day9/dashboard.py` (Flask, reusing the same dependency Day 2
+already installed — no new package) with three routes matching the
+tracker's spec exactly: `/` (live feed — real transactions, risk chips,
+reason codes, hold state, last policy decision), `/audit` (the hash-chain
+verify banner, shown live, plus a real tamper-and-repair demo button), and
+`/metrics` (rule-engine PR curve, a back-calculated confusion matrix, a
+real ₹ cost/value estimate, and the Day 5-stretch ablation table). Every
+number on `/metrics` is sourced in `day9/real_results.py`'s comments —
+none of it is invented for the demo. Full story in the build log entry
+below.
+
+**Next up: Day 10** (`artifact/tracker.html`'s plan — edge cases, failure
+modes, README polish, repo cleanup, make the repo public, freeze scope).
+After that: the Final Day pitch video, which should lean on `/metrics` and
+`/audit` as the visual evidence — a live chain-verify banner and a real PR
+curve read better on camera than a terminal log.
 
 **Naming correction, 2026-08-26:** this classifier briefly lived at
 `day8/train_classifier.py`. That was a real mistake, not a style choice —
@@ -558,4 +574,333 @@ front of me or pasted in; see "Next up" above.
 
 ---
 
-*(new entries append below this line as the build continues)*
+## Day 9 — the dashboard, and a real reuse-not-duplicate refactor first
+
+Before touching the dashboard itself, `agent/agent_tools.py`'s `run_demo()`
+had a problem waiting to happen: it hand-wrote the demo seed data (two
+transactions, two risk scores, one dispute) and the three real tool calls
+inline, in a function whose whole point is to be a CLI entry point, not a
+reusable library call. The tracker's Day 9 spec wants a "seed demo data"
+button on the dashboard doing the exact same seeding — and copy-pasting
+that block into `day9/dashboard.py` would have created two independent
+copies of "what the demo scenario is" that could silently drift apart the
+first time either one got edited.
+
+Fixed before writing a single dashboard route: extracted
+`seed_demo_scenario(conn) -> dict` out of `run_demo()`'s body. It does the
+seeding and the three real tool calls (`tool_hold_payment` twice,
+`tool_draft_dispute_evidence`, `tool_notify_merchant`) and returns their
+results; `run_demo()` now just calls it and prints from the returned dict.
+Deliberately does NOT include `run_demo()`'s tamper-and-reverify trick at
+the end — a function meant to be called from a "seed demo data" button
+shouldn't leave the audit chain permanently broken as a side effect.
+Verified with `python3 -c "import ast; ast.parse(...)"` for syntax, then a
+full `rm -f risk_agent.db && python3 agent/agent_tools.py --demo` re-run —
+output was byte-for-byte the same shape as before the refactor (mid-risk
+auto-hold, high-risk queued, real Claude-drafted evidence at
+confidence=0.15, stubbed email, chain intact, then correctly broken after
+the CLI's own tamper step). Same "exactly one implementation" discipline
+this project has used since Day 1's `evaluate_policy()`.
+
+Then the dashboard itself — `day9/dashboard.py`, Flask (the tracker
+explicitly says "keep the framework choice boring," and Flask is already a
+proven dependency from Day 2's `webhook_listener.py`; zero new packages).
+One file, on purpose — a judge should be able to open exactly one file and
+see every route, query, and template together, not hunt across a
+`templates/` folder for a 10-day solo build. Three routes, matching the
+tracker's spec item for item:
+
+- `/` — live feed. Queries `transactions` joined against each payment's
+  latest `risk_scores` row and its most recent `hold_payment`/
+  `release_payment` entry in `agent_actions`. Risk chips color by score
+  (red ≥0.8, amber ≥0.5, green below), reason codes render as their own
+  chips straight from the stored JSON array — nothing summarized or
+  reworded. A "Seed demo data" button calls the real
+  `seed_demo_scenario()` above (not a dashboard-only copy), and "Reset"
+  calls the real `init_db(fresh=True)`.
+- `/audit` — calls `verify_audit_chain()` live, on every page load, and
+  shows the real result in a banner — green "chain intact" or red "chain
+  BROKEN at row id N" — plus the actual `agent_actions` rows with their
+  hashes. A "Tamper row 1" button does a real `UPDATE agent_actions SET
+  agent_reasoning = ...` and redirects back to `/audit`, so the banner
+  visibly flips from green to red on the next load — the same
+  tamper-and-reverify proof `--demo` already does at the CLI, now
+  click-through. "Reset & reseed" repairs it the same way `--demo`'s own
+  fresh run would.
+- `/metrics` — the rule engine's real PR curve (both the shipped 0.8
+  threshold and the best-F1 point), a back-calculated confusion matrix and
+  ₹ cost/value estimate at the shipped threshold, and the full Day
+  5-stretch ablation table. Every number here is sourced in
+  `day9/real_results.py`'s docstring and comments — the confusion matrix
+  is explicitly labeled as back-calculated from precision/recall/fraud-
+  count (the original scripts saved rates, not raw counts), and the
+  stretch classifier's numbers carry an explicit "not deployed" note so
+  the dashboard itself doesn't misrepresent it as live.
+
+Tested for real before delivering, not just written and assumed correct:
+started the Flask dev server in the sandbox, then `curl`'d every route —
+empty-DB state on `/` (correct "no transactions yet" message), seeded
+state (both demo payments with correct risk chips and hold state showing),
+`/audit` showing "chain intact" after seeding, tamper flipping it to "chain
+BROKEN at row id 1" with the tampered reasoning text visible, reseed
+repairing it back to "chain intact," and `/metrics` rendering with no
+Jinja errors and the exact ablation numbers from `ARCHITECTURE.md` §3b.
+One real hiccup along the way: my first test used `curl -X POST ... -L`,
+which showed a confusing `405` — traced it to curl re-issuing the POST
+against the redirect target itself (a curl quirk, not a Flask bug); the
+server log showed the original `POST /seed` had already returned a correct
+`302` and written the data before the spurious follow-up request. Confirmed
+by testing without `-L` and checking the server's own access log, not by
+assuming it was fine.
+
+---
+
+## Day 9 (continued) — a real crash on the first actual run, on your machine
+
+First time `day9/dashboard.py` was actually run outside the sandbox — on
+your machine, against your real `risk_agent.db` — `GET /` threw a 500:
+`sqlite3.OperationalError: no such column: on_hold`. This was a real bug in
+what I shipped, not a fluke or an environment quirk, and it exposed a gap
+in how I'd tested it.
+
+Root cause: `risk_agent.db` in the project root is a persistent file, not
+something recreated on every run — it's whatever was last written by any
+`dayN` script or the CLI, going back to early in the build, before Day 7
+added the `on_hold`/`held_at` columns to `transactions` in `sql/schema.sql`.
+SQLite does not migrate an existing table when the `CREATE TABLE` text in
+schema.sql changes later — the table on disk keeps whatever columns it had
+when it was created, forever, until something explicitly drops and
+recreates it. Your local db file predates that column and nothing since
+had forced it to be rebuilt, so it sat there silently missing a column
+until `dashboard.py`'s live feed was the first thing to actually query it.
+
+The gap in my own testing: I tested the empty-db case (file doesn't exist)
+and the freshly-seeded case (file created by `init_db()` from the CURRENT
+schema.sql, in the same session), but never a db file that exists and is
+simply outdated — the one case that was guaranteed to be true the moment
+this ran somewhere other than my sandbox, where I'd never had an old
+`risk_agent.db` lying around in the first place. `if not
+os.path.exists(DB_PATH)` was checking the wrong thing — "does a file
+exist" isn't "is the file's schema what the code expects."
+
+Fixed in `day9/dashboard.py`: added `schema_mismatch_column(conn)`, which
+checks (via `PRAGMA table_info`) whether `transactions` actually has the
+columns the live feed query needs, before running that query. If it
+doesn't, `/` now renders a clear in-page banner explaining exactly why
+(leftover file, pre-dates a schema change, SQLite doesn't auto-migrate)
+with a working "Reset" button, instead of a raw Flask traceback. Verified
+the fix for real, not just written and assumed: built a throwaway sqlite
+file by hand with `transactions`/`agent_actions` tables in their
+pre-Day-7 shape (no `on_hold`/`held_at`), pointed `RISK_AGENT_DB` at it,
+and confirmed through Flask's test client that `GET /` now returns 200
+with the banner instead of 500, and that clicking Reset actually recreates
+the db from the current schema and the live feed then renders normally.
+
+The honest caveat this doesn't cover: this checks specifically for the
+columns THIS dashboard's queries touch, not a general "is this db exactly
+current" check — if a later day adds more schema changes, whatever new
+column that day's queries need would need the same treatment. Documented
+here so that's a known, deliberate scope limit rather than a surprise.
+
+## Day 9 (continued again) — the fix above had a real, worse mistake in it
+
+Screenshots of the deployed fix showed something I hadn't accounted for:
+`/audit` was already displaying 4 rows of genuine agent reasoning — real
+sentences like "Risk score 0.85 driven by new/unrecognized customer email
+combined with multiple transactions from the same email within the last
+hour" — that read nothing like `seed_demo_scenario()`'s canned reason
+strings ("Testing mid-risk auto-hold path"). That's real output from an
+earlier live Claude Agent SDK run (Day 6 or Day 7 testing), sitting in
+`risk_agent.db`, chain-intact and untouched. It makes total sense once you
+separate the two tables: Day 7's schema change only added columns to
+`transactions`, never touched `agent_actions` — so the audit trail was
+always going to read fine regardless of the `on_hold` gap, while the live
+feed broke on exactly that one table.
+
+The mistake: my previous fix's only remedy was a "Reset" button, and
+`reset()` calls `init_db(fresh=True)`, which deletes the entire db file
+and recreates it empty. If you'd clicked the only button the banner
+offered, that real historical audit trail — genuinely good material for
+the pitch video, and the only surviving evidence of an earlier live run —
+would have been gone, permanently, to fix what was actually a one-column
+gap in one table. That's a worse failure mode than the crash it replaced:
+a crash is obviously wrong and stops you; a "fix" that quietly destroys
+real data the moment you click the only button offered is not obvious
+until it's too late.
+
+Fixed properly: added `repair_schema(conn)`, which runs `ALTER TABLE
+transactions ADD COLUMN ...` for exactly the columns that are missing
+(`on_hold INTEGER NOT NULL DEFAULT 0`, `held_at INTEGER`, matching
+`sql/schema.sql`'s definitions exactly) and nothing else — SQLite performs
+this in place, existing rows keep their data, other tables are untouched.
+The banner on `/` now offers "Repair schema" as the primary action with an
+explanation of why it's the right default, and keeps "Full reset" as a
+clearly-labeled destructive fallback for when someone actually wants to
+start over. New `/repair` route, `list[str]`-returning `repair_schema()`
+used by it.
+
+Verified for real, not assumed: built a throwaway db with the same
+pre-Day-7 `transactions`/`agent_actions` shape as before, but this time
+also inserted a real transaction row and a real, properly-hash-chained
+`agent_actions` row with genuine-looking reasoning text, to stand in for
+exactly what was actually sitting in the real `risk_agent.db`. Confirmed
+through Flask's test client: before repair, `/` shows the banner and
+`/audit` already shows the real historical row with an intact chain
+(matching what the screenshots showed); after `POST /repair`, `/` renders
+normally AND still shows the preserved transaction row, and `/audit`
+still shows the same historical reasoning text with the chain still
+intact — nothing was lost, only the missing columns were added.
+
+The lesson worth keeping: "fix the crash" and "fix it safely" aren't the
+same task, and the difference only showed up because real screenshots of
+real data surfaced it — a case for looking at what a fix actually does to
+existing state, not just whether it stops the traceback.
+
+## Day 9 (continued a third time) — the repair itself left one column wrong
+
+More screenshots, this time of the repaired dashboard actually working —
+`pay_scenario_mid` and `pay_scenario_high` rendering with real amounts,
+risk scores, and reason codes. But the Hold column said "clear" for both,
+while the Last agent decision column said `auto executed` /
+`mid_risk_small_amount_hold` for the first one. Those two columns
+shouldn't be able to disagree — "auto executed" for `hold_payment` means
+`tool_hold_payment` actually ran `UPDATE transactions SET on_hold = 1`
+(confirmed by re-reading the function directly: the `auto` tier branch
+sets `on_hold = 1, held_at = ...` before logging the action;
+`queued_for_approval` deliberately does NOT touch `on_hold` at all — that
+tier means nothing has executed yet, which is correct, not a bug).
+
+Root cause, and it's mine: the schema repair from two entries ago used
+`ALTER TABLE transactions ADD COLUMN on_hold INTEGER NOT NULL DEFAULT 0`.
+SQLite applies that default to every existing row unconditionally — it
+has no way to know what the column's value *should* have been for a row
+that predates the column's existence. For `pay_scenario_mid`, the correct
+value was recoverable — `agent_actions` already has the real
+`auto_executed hold_payment` row proving it was actually held — but the
+repair never looked at that log, so the column just landed on the
+schema's literal default (0/clear) instead. A `DEFAULT` value is a
+guess, and here it guessed wrong for exactly the rows that had a real
+answer sitting one table over.
+
+Fixed with `backfill_hold_state(conn)`: recomputes `on_hold`/`held_at`
+for every payment from its own `agent_actions` history — specifically,
+whichever of `hold_payment`/`release_payment` was most recently logged
+with `decision_tier` `auto_executed` or `human_approved` (i.e. actually
+executed, not merely queued or denied). `repair_schema()` now calls it
+automatically right after adding any missing column, and the `/repair`
+route calls it unconditionally on every hit — not just when a column was
+freshly added — because the db on your machine had already been through
+the OLD repair once, meaning the columns already exist and the
+"only backfill when we just added a column" guard would otherwise never
+fire again for it. Also added a standing "Sync hold state from audit log"
+button to the live feed's normal controls (not just the schema-mismatch
+banner), since a derived column silently drifting from its source of
+truth isn't a one-time migration problem — it's a class of bug that
+deserves an always-available, self-service fix, framed honestly as what
+it is: an idempotent re-derivation from `agent_actions`, never a guess.
+
+Verified against a hand-built reproduction that mirrors the exact bug —
+a `pay_scenario_mid` row with `on_hold=0` but a real `auto_executed
+hold_payment` already logged, and a `pay_scenario_high` row that's
+genuinely still `queued_for_approval` (never executed). Before the sync:
+both showed "clear," matching the screenshots exactly. After
+`POST /repair`: `pay_scenario_mid` correctly flips to "on hold,"
+`pay_scenario_high` correctly stays "clear" — proving the fix repairs
+the real drift without falsely holding a payment that was only ever
+queued, not held.
+
+Three build-log entries in a row on what was meant to be one fix. Worth
+naming plainly rather than glossing over: the first pass stopped a crash,
+the second pass stopped it from being destructive, and it took a third
+look at real data to catch that the "safe" repair had quietly written a
+wrong fact into the database. Each one only surfaced because real
+screenshots of the real dashboard, against the real file on your machine,
+were checked rather than assumed correct after the previous fix shipped.
+
+## Day 10 — edge-case testing found two real crashes, both fixed
+
+Started Day 10 with the tracker's own instruction: "test missing fields,
+webhook retries, duplicate payment_ids — fix or document." Ran each
+against the real code instead of reasoning about it in the abstract.
+
+**Duplicate payment_ids: not reachable, and confirmed why.** Every code
+path that inserts into `transactions` (`run_demo()`, `day6/run_scenario.py`,
+the dashboard's `/seed`) calls `init_db(fresh=True)` first — checked all
+three directly. There's also no live webhook-to-database ingestion
+pipeline anywhere in this build (`day2/webhook_listener.py` verifies a
+signature and prints; it never writes to `transactions`) — a real,
+deliberate scope limit, not an oversight, and now stated as such. Built a
+throwaway db and ran a real duplicate `INSERT` against the actual schema
+to confirm what WOULD happen if a future ingestion path existed:
+`sqlite3.IntegrityError: UNIQUE constraint failed: transactions.payment_id`
+— documented, not fixed, since fixing it would mean building a feature
+(idempotent webhook ingestion) that's genuinely out of scope for a 10-day
+solo build already flagged as a known limitation.
+
+**Webhook retries and missing fields: tested for real, both fine.** Sent
+an identical signed body through `/webhook` twice via Flask's test client
+— both times 200, byte-identical response, because signature
+verification is a pure function and nothing downstream mutates state.
+Sent `{}` (a webhook payload missing every field) — 200, no crash,
+because the code already uses `payload.get("event")` rather than
+`payload["event"]`. Both are real, verified facts now, not assumptions.
+
+**Malformed JSON body with a technically-valid signature: a real crash,
+and a real fix.** A signature only proves the sender knew the secret — it
+says nothing about whether the body is valid JSON. Sent a body that
+doesn't parse (`{not valid json!!`) signed correctly over those exact
+bytes: unhandled `json.JSONDecodeError` inside the route, Flask's default
+500 handler, full traceback dumped to the terminal. Worse than just an
+ugly error: Razorpay's real webhook delivery retries on any non-2xx
+response, so a single malformed body would have retried indefinitely
+instead of failing once and staying failed. Fixed by wrapping
+`json.loads(body)` in a `try/except json.JSONDecodeError`, returning a
+clean `400` — signature check still runs first and still rejects a wrong
+signature the same way, verified by re-running both cases through the
+test client after the fix.
+
+**A second, more serious crash found while testing the first one.** While
+setting up a "missing data" test for the agent tools (a payment_id the
+system has genuinely never seen — not a malformed one, a well-formed but
+unknown one), `tool_hold_payment` crashed: `sqlite3.IntegrityError:
+FOREIGN KEY constraint failed`. Root cause: `agent_actions.payment_id`
+and `.dispute_id` are real foreign keys into `transactions`/`disputes`
+(by design — it's what guarantees every audit-log row ties to something
+real), and every `tool_*` function unconditionally calls
+`log_agent_action()` with whatever id it was given, even one that was
+never inserted anywhere. The existing permission-gate check
+(`_validate_tool_input`) only validates the id's *shape* (`pay_.../disp_...`
+prefix) — it doesn't check the id actually exists, and it only runs for
+calls that go through the live Agent SDK loop at all, not for the six
+`day7`/dashboard/test scripts that call `tool_hold_payment` and friends
+directly. So a well-formed-but-hallucinated id from the agent, or a typo
+in a direct call, would crash the whole call instead of failing cleanly —
+a real gap in a project whose entire pitch rests on "the agent never
+silently claims success and never just crashes."
+
+Checked all six tool functions that log an action tied to a payment_id or
+dispute_id (`tool_hold_payment`, `tool_release_payment`,
+`tool_notify_merchant`, `tool_draft_dispute_evidence`,
+`tool_submit_dispute_evidence`, `tool_accept_dispute`) — all six had the
+identical vulnerability, confirmed by calling each directly against an
+unknown id before touching any code. Fixed with one shared helper,
+`_not_found_result()`, and an existence check at the top of each of the
+six functions, returning a clean `{"status": "not_found", ...}` before
+anything else runs (before any live Razorpay call, before
+`evaluate_policy()`, before any log write). Deliberately does NOT write
+to `agent_actions` for this case — logging against an id that doesn't
+exist would either violate the same foreign key or require weakening it,
+and an unknown id isn't really "the agent acting on your data," it's an
+input-validation failure, the same category `_validate_tool_input`
+already denies without logging. Verified for real: called all six
+functions with unknown ids and confirmed a clean `not_found` result with
+zero rows written to `agent_actions`, then re-ran `--demo` end to end and
+confirmed byte-for-byte identical output to before the fix — the guard
+adds a check, it doesn't change any real behavior.
+
+Both fixes are cheap, small, and land exactly on this project's own
+stated design principle rather than adding new behavior — which is
+probably why they were worth finding: a "never crash, always report
+honestly" pledge is only as real as the code paths that were actually
+tested against it, and two of the eight tool-call paths in this codebase
+hadn't been, until today.

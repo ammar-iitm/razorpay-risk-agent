@@ -221,6 +221,30 @@ def tool_get_risk_assessment(conn: sqlite3.Connection, payment_id: str) -> dict:
     return score
 
 
+def _not_found_result(id_field: str, id_value: str) -> dict:
+    """Shared shape for the 'nothing local to act on' response every
+    tool_* function below returns when handed a well-formed but unknown
+    payment_id/dispute_id (Day 10 edge-case pass — found by actually
+    calling tool_hold_payment with a nonexistent payment_id and watching
+    it crash, not by inspection). Deliberately does NOT call
+    log_agent_action: agent_actions.payment_id/dispute_id are both real
+    foreign keys into transactions/disputes, so logging against an id
+    that doesn't exist locally would violate that constraint (that's
+    exactly the crash this fixes: sqlite3.IntegrityError, FOREIGN KEY
+    constraint failed). Silently-but-honestly refusing here mirrors how
+    _validate_tool_input already denies a MALFORMED id at the permission
+    gate without an audit-log write — an unknown-but-well-formed id is
+    the same category of input problem, just caught one layer deeper so
+    it also covers tool_* functions called directly (day7 scripts, tests,
+    the dashboard) that bypass the Agent SDK's permission gate entirely."""
+    return {
+        "status": "not_found", id_field: id_value,
+        "note": f"no local record of this {id_field} — refusing to act on an unknown "
+                f"{'transaction' if id_field == 'payment_id' else 'dispute'} rather than guessing. "
+                "Not logged to the audit trail: there's no real row to attach the entry to.",
+    }
+
+
 def _verify_live_status(conn: sqlite3.Connection, payment_id: str, local_status: Optional[str], local_amount: Optional[int]) -> tuple[str, Optional[str], Optional[int]]:
     """Day 7: check the payment's LIVE status on Razorpay before a
     hold/release decision commits to anything, when credentials are
@@ -250,7 +274,9 @@ def _verify_live_status(conn: sqlite3.Connection, payment_id: str, local_status:
 
 def tool_hold_payment(conn: sqlite3.Connection, payment_id: str, reason: str) -> dict:
     txn = conn.execute("SELECT amount, status FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
-    local_amount, local_status = (txn[0], txn[1]) if txn else (None, None)
+    if txn is None:
+        return _not_found_result("payment_id", payment_id)
+    local_amount, local_status = txn[0], txn[1]
 
     live_note, live_status, amount = _verify_live_status(conn, payment_id, local_status, local_amount)
     full_reasoning = f"{reason} | {live_note}"
@@ -303,7 +329,9 @@ def tool_hold_payment(conn: sqlite3.Connection, payment_id: str, reason: str) ->
 
 def tool_release_payment(conn: sqlite3.Connection, payment_id: str, reason: str) -> dict:
     txn = conn.execute("SELECT amount, status FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
-    local_amount, local_status = (txn[0], txn[1]) if txn else (None, None)
+    if txn is None:
+        return _not_found_result("payment_id", payment_id)
+    local_amount, local_status = txn[0], txn[1]
     live_note, _live_status, _amount = _verify_live_status(conn, payment_id, local_status, local_amount)
     full_reasoning = f"{reason} | {live_note}"
 
@@ -346,12 +374,14 @@ def tool_draft_dispute_evidence(conn: sqlite3.Connection, dispute_id: str) -> di
     dispute_row = conn.execute(
         "SELECT payment_id, reason_code, amount, respond_by FROM disputes WHERE dispute_id = ?", (dispute_id,)
     ).fetchone()
+    if dispute_row is None:
+        return _not_found_result("dispute_id", dispute_id)
     dispute = {
         "dispute_id": dispute_id,
-        "payment_id": dispute_row[0] if dispute_row else None,
-        "reason_code": dispute_row[1] if dispute_row else None,
-        "amount": dispute_row[2] if dispute_row else None,
-        "respond_by": dispute_row[3] if dispute_row else None,
+        "payment_id": dispute_row[0],
+        "reason_code": dispute_row[1],
+        "amount": dispute_row[2],
+        "respond_by": dispute_row[3],
     }
 
     payment = {}
@@ -401,6 +431,8 @@ def tool_draft_dispute_evidence(conn: sqlite3.Connection, dispute_id: str) -> di
 
 
 def tool_submit_dispute_evidence(conn: sqlite3.Connection, dispute_id: str, evidence: dict) -> dict:
+    if conn.execute("SELECT 1 FROM disputes WHERE dispute_id = ?", (dispute_id,)).fetchone() is None:
+        return _not_found_result("dispute_id", dispute_id)
     # ALWAYS gated per policy_config 'submit_evidence_gate' (approval_required),
     # regardless of confidence — irreversible + reputationally sensitive.
     tier, rule = evaluate_policy(conn, "submit_dispute_evidence", {})
@@ -420,6 +452,8 @@ def tool_submit_dispute_evidence(conn: sqlite3.Connection, dispute_id: str, evid
 
 
 def tool_accept_dispute(conn: sqlite3.Connection, dispute_id: str, reason: str) -> dict:
+    if conn.execute("SELECT 1 FROM disputes WHERE dispute_id = ?", (dispute_id,)).fetchone() is None:
+        return _not_found_result("dispute_id", dispute_id)
     # By design this function can NEVER execute the real accept — only
     # ever logs a recommendation. This is enforced in code, not just policy,
     # because "never_auto" is a stronger guarantee than "usually gated."
@@ -435,6 +469,8 @@ def tool_accept_dispute(conn: sqlite3.Connection, dispute_id: str, reason: str) 
 
 
 def tool_notify_merchant(conn: sqlite3.Connection, payment_id: str, message: str) -> dict:
+    if conn.execute("SELECT 1 FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone() is None:
+        return _not_found_result("payment_id", payment_id)
     # Day 8: real email via agent/notify_channel.py, soft-fails to an
     # honestly-labeled "stubbed" state if SMTP isn't configured — see that
     # module's docstring for why email over WhatsApp.
@@ -598,10 +634,20 @@ async def run_agent(user_prompt: str, conn: Optional[sqlite3.Connection] = None,
 # 5. SELF-CONTAINED DEMO — proves the gating + audit chain actually work
 # ============================================================================
 
-def run_demo() -> None:
-    init_db(fresh=True)
-    conn = get_conn()
+def seed_demo_scenario(conn: sqlite3.Connection) -> dict:
+    """Seeds the scripted demo transactions/scores/dispute and runs the
+    three real tool calls (hold, draft evidence, notify) against a FRESH
+    db (caller's responsibility to init_db(fresh=True) first). Extracted
+    out of run_demo() so day9/dashboard.py's "seed demo data" button reuses
+    the exact same seeding + real tool calls as the CLI --demo, rather than
+    a second hand-written copy that could drift from it — same "exactly one
+    implementation" discipline as evaluate_policy() and log_agent_action().
 
+    Deliberately does NOT do run_demo()'s tamper-and-reverify trick at the
+    end — that's --demo's own party trick for a terminal audience, and
+    leaving it in here would mean anything that calls this (like the
+    dashboard) ships with a permanently-broken audit chain, which is the
+    opposite of what a fresh demo dataset should look like."""
     now = int(time.time())
     conn.execute(
         "INSERT INTO transactions (payment_id, order_id, amount, currency, status, method, captured, email, razorpay_created_at) "
@@ -631,11 +677,24 @@ def run_demo() -> None:
     )
     conn.commit()
 
+    hold_mid = tool_hold_payment(conn, "pay_demo_mid", "Testing mid-risk auto-hold path")
+    hold_high = tool_hold_payment(conn, "pay_demo_high", "Velocity spike + amount outlier detected")
+    draft = tool_draft_dispute_evidence(conn, "disp_demo_1")
+    notify = tool_notify_merchant(conn, "pay_demo_mid", "Your payment was placed on hold pending review.")
+    return {"hold_mid": hold_mid, "hold_high": hold_high, "draft": draft, "notify": notify}
+
+
+def run_demo() -> None:
+    init_db(fresh=True)
+    conn = get_conn()
+
+    result = seed_demo_scenario(conn)
+
     print("--- Mid risk (0.85), small amount (Rs.500): expect auto_executed ---")
-    print(tool_hold_payment(conn, "pay_demo_mid", "Testing mid-risk auto-hold path"))
+    print(result["hold_mid"])
 
     print("\n--- High risk (0.91), large amount (Rs.15,000): expect queued_for_approval ---")
-    print(tool_hold_payment(conn, "pay_demo_high", "Velocity spike + amount outlier detected"))
+    print(result["hold_high"])
 
     print("\n--- Note: a genuinely LOW-risk hold_payment call (score < 0.8) has NO matching")
     print("    'auto' rule in policy_config, so it correctly fails safe to approval_required")
@@ -644,13 +703,13 @@ def run_demo() -> None:
 
     print("\n--- Drafting dispute evidence (Day 8: real Claude call if the CLI is available, "
           "an obviously-generic placeholder otherwise -- either way, never a crash) ---")
-    draft = tool_draft_dispute_evidence(conn, "disp_demo_1")
+    draft = result["draft"]
     print(f"generated_by={draft['generated_by']}  confidence={draft['confidence']}")
     print(f"summary: {draft['summary']}")
 
     print("\n--- Notifying merchant (Day 8: real email if SMTP_* is configured, "
           "an honestly-reported 'stubbed' result otherwise) ---")
-    notify = tool_notify_merchant(conn, "pay_demo_mid", "Your payment was placed on hold pending review.")
+    notify = result["notify"]
     print(f"sent={notify['sent']}  detail={notify['detail']}")
 
     print("\n--- Verifying audit chain integrity ---")

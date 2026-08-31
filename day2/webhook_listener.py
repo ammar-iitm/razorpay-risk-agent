@@ -39,7 +39,20 @@ def webhook():
         print("!!! SIGNATURE MISMATCH — rejecting, not processing payload !!!")
         return jsonify({"status": "signature invalid"}), 400
 
-    payload = json.loads(body)
+    # A signature can verify against bytes that still aren't valid JSON --
+    # signing only proves the sender knew the secret, not that the body
+    # parses. Found this the hard way (Day 10 edge-case pass): an unhandled
+    # json.loads() here turns a malformed body into a raw 500 with a
+    # traceback dumped to the terminal, and — worse for a real integration
+    # — Razorpay's webhook delivery treats a non-2xx as a delivery failure
+    # and retries, so a single bad payload would otherwise retry forever
+    # rather than failing once and staying failed.
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        print(f"!!! SIGNATURE VALID but body is not valid JSON — rejecting: {e} !!!")
+        return jsonify({"status": "invalid JSON body"}), 400
+
     event = payload.get("event")
     print(f"\n=== Verified webhook: {event} ===")
     print(json.dumps(payload, indent=2))

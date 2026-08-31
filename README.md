@@ -2,6 +2,15 @@
 
 An AI agent that detects payment fraud and disputes for Razorpay, with policy-gated autonomy tiers and a tamper-evident audit trail. Built solo for the [Razorpay AI Buildathon](https://razorpay.com/buildathon/) — AI Risk Manager track.
 
+**One command to see it running:**
+
+```bash
+python3 day9/dashboard.py
+# open http://127.0.0.1:5050, click "Seed demo data"
+```
+
+No API key needed for this path — it's the same policy engine, audit trail, and detector the rest of this README describes, just click-through instead of terminal output.
+
 ## What makes this different from "an LLM that scores fraud"
 
 - **The agent's authority to touch money is defined in one auditable database table, not in prompt instructions.** [`policy_config`](sql/schema.sql) maps every action to `auto` / `approval_required` / `never_auto`, and [`evaluate_policy()`](agent/agent_tools.py) consults it on every single tool call — including from inside a live Claude Agent SDK loop, not just in isolated tests. See [`day6/run_scenario.py`](day6/run_scenario.py) for a real, verified run.
@@ -11,7 +20,15 @@ An AI agent that detects payment fraud and disputes for Razorpay, with policy-ga
 ## Quick start
 
 ```bash
-# Zero-setup demo — policy gating + hash-chained audit trail, no API key needed
+# Easiest path — browser dashboard: live feed, audit trail with a live
+# chain-verify banner, and a metrics page with real PR curve / confusion
+# matrix / cost estimate. No API key, no other setup.
+python3 day9/dashboard.py
+# then open http://127.0.0.1:5050 and click "Seed demo data"
+```
+
+```bash
+# Terminal demo — same policy gating + hash-chained audit trail, no API key needed
 python3 agent/agent_tools.py --demo
 
 # Full live agent loop — requires the Claude Code CLI installed & authenticated
@@ -22,6 +39,22 @@ python3 day6/run_scenario.py --live
 ```
 
 The live run seeds two payments and one dispute, then hands control to a real Claude agent that has to decide what to do using only the gated tools — no scripted responses. It correctly auto-holds a small-amount payment, correctly queues a large-amount one for human approval, and drafts (but never submits) real dispute evidence via a live Claude call. As of Day 8 the honesty goes further than the agent's own reasoning: when `notify_merchant`'s real email channel isn't configured, the tool itself reports that plainly, and the orchestrating Claude reads that and tells the human, unprompted — *"the merchant may not have actually received the email... you should configure those environment variables."* Full trace in [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md)'s Day 6 and Day 8 entries.
+
+## Screenshots
+
+Real screenshots of the dashboard above, running against real (seeded) data — nothing staged or mocked up for this README.
+
+**Live feed** — policy-gated decisions as they happen: a small-amount payment auto-held, a large-amount one queued for human approval.
+
+![Live feed](docs/screenshots/live_feed.png)
+
+**Audit trail** — every action hash-chained, with a live tamper-check banner and the real reasoning text behind each decision.
+
+![Audit trail](docs/screenshots/audit_trail.png)
+
+**Metrics** — the PR curve and confusion matrix from `day5/evaluate.py`'s real evaluation, not a claimed number.
+
+![Metrics](docs/screenshots/metrics.png)
 
 ## Architecture
 
@@ -69,8 +102,13 @@ This is a real, incremental, dated build — the `dayN/` folders aren't a cosmet
 | `day5/` | The rule engine, its real precision/recall evaluation, and the stretch-goal classifier with a leakage ablation check |
 | `day6/` | The live Claude Agent SDK orchestrator, tools wired end to end |
 | `day7/` | Live verification script for `hold_payment`/`release_payment` against a real completed checkout |
-| `docs/` | Architecture rationale, the build log, network troubleshooting notes, pre-submission checklist |
+| `day9/` | The browser dashboard (`dashboard.py`) and its sourced metrics data (`real_results.py`) |
+| `docs/` | Architecture rationale ([`ARCHITECTURE.md`](docs/ARCHITECTURE.md)), the full first-person build log ([`BUILD_LOG.md`](docs/BUILD_LOG.md)), the curated failure-modes writeup ([`FAILURE_MODES.md`](docs/FAILURE_MODES.md)), network troubleshooting notes, pre-submission checklist |
+
+## Failure modes: what broke, what's still a known gap
+
+The buildathon asks for real technical failures and how they were recovered from. **[`docs/FAILURE_MODES.md`](docs/FAILURE_MODES.md)** is the curated answer — real bugs found by actually running the code against real or realistic inputs (a malformed webhook body, a hallucinated-but-well-formed payment id, a stale pre-migration database) and fixed, kept separate from limitations that are documented and deliberately left as-is because fixing them means building a feature this 10-day solo build never claimed to have. The full, unedited, first-person account of every one of these — as they happened, in order — is in [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md).
 
 ## Known limitations
 
-Stated explicitly rather than hidden — see [`docs/ARCHITECTURE.md` §10](docs/ARCHITECTURE.md): `hold_payment` is internal state rather than a native Razorpay primitive (Razorpay has no "freeze this payment" endpoint), though it now reconciles against Razorpay's real live payment status before acting (Day 7); Razorpay's test mode has no way to simulate a dispute, so `submit_dispute_evidence`/`accept_dispute` are verified via a seeded-data live agent run rather than a real Razorpay dispute (`draft_dispute_evidence` itself is real and live — Day 8); no external anchoring on the audit chain; single-agent architecture by deliberate scope, not oversight.
+Stated explicitly rather than hidden — see [`docs/ARCHITECTURE.md` §10](docs/ARCHITECTURE.md) and [`docs/FAILURE_MODES.md`](docs/FAILURE_MODES.md) for the full reasoning behind each: `hold_payment` is internal state rather than a native Razorpay primitive (Razorpay has no "freeze this payment" endpoint), though it now reconciles against Razorpay's real live payment status before acting (Day 7); Razorpay's test mode has no way to simulate a dispute, so `submit_dispute_evidence`/`accept_dispute` are verified via a seeded-data live agent run rather than a real Razorpay dispute (`draft_dispute_evidence` itself is real and live — Day 8); there is no live webhook-to-database ingestion pipeline, so every transaction comes from a seed script, not a live Razorpay event; no external anchoring on the audit chain; single-agent architecture by deliberate scope, not oversight.
