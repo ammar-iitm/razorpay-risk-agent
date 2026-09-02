@@ -13,9 +13,11 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agent"))
 import agent_tools  # noqa: E402
+import notify_channel  # noqa: E402
 
 RESULTS = []
 
@@ -283,11 +285,103 @@ def t_no_risk_score_at_all():
     conn.close(); os.remove(path)
 
 
+def t_concurrent_writers_dont_break_the_chain():
+    """Two connections racing to log_agent_action() used to both read the
+    same "last hash" before either committed (a SELECT never blocks a
+    writer), so the second writer's this_hash got computed from an
+    already-stale prev_hash -- verify_audit_chain() then reported that as
+    tampering that never actually happened. Found with real threads, not a
+    manual simulation: 5/5 trials broke the chain before the fix. Fixed by
+    wrapping the read+insert in one BEGIN IMMEDIATE transaction so a second
+    writer's own BEGIN IMMEDIATE blocks until the first commits. This test
+    fires 12 real threads, each on its own connection, at the same
+    payment_id and asserts the chain still verifies intact afterward."""
+    conn, path = fresh_conn()
+    seed_one(conn, "pay_race", amount=50000, score=0.85)
+    conn.close()
+
+    N = 12
+    errors = []
+
+    def worker(i):
+        try:
+            c = agent_tools.get_conn()
+            agent_tools.log_agent_action(
+                c, payment_id="pay_race", dispute_id=None, action_type="notify_merchant",
+                decision_tier="auto_executed", risk_score_at_decision=None,
+                policy_rule_applied=f"race_{i}", agent_reasoning=f"writer {i}",
+                tool_input={"i": i}, tool_output={}, actor="agent",
+            )
+            c.close()
+        except Exception as e:
+            errors.append((i, e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"writer thread(s) raised: {errors}"
+    verify_conn = agent_tools.get_conn()
+    row_count = verify_conn.execute("SELECT COUNT(*) FROM agent_actions").fetchone()[0]
+    ok, bad_row = agent_tools.verify_audit_chain(verify_conn)
+    assert row_count == N, f"expected {N} rows from {N} racing writers, got {row_count}"
+    assert ok is True, f"chain should verify intact -- no tampering ever happened: bad_row={bad_row}"
+    verify_conn.close()
+    os.remove(path)
+
+
 def t_unknown_action_type_fails_safe():
     conn, path = fresh_conn()
     tier, rule = agent_tools.evaluate_policy(conn, "delete_everything", {"amount": 1})
     assert tier == "approval_required" and rule == "default_fail_safe", f"unknown action_type: {tier}, {rule}"
     conn.close(); os.remove(path)
+
+
+def t_malformed_operator_in_condition_fails_safe():
+    """A typo'd operator (e.g. '=>' instead of '>=') in a hand-edited
+    policy_config row used to KeyError the whole evaluate_policy() call --
+    found by actually inserting one and calling it. Fixed: an unrecognized
+    operator makes that clause not match rather than crash, so a malformed
+    rule just never fires and the action correctly falls through to
+    evaluate_policy()'s own approval_required default instead of taking
+    down the tool call that triggered it."""
+    conn, path = fresh_conn()
+    conn.execute("UPDATE policy_config SET is_active = 0 WHERE action_type = 'hold_payment'")
+    conn.execute(
+        "INSERT INTO policy_config (rule_name, action_type, condition_json, autonomy_tier) "
+        "VALUES ('typo_rule', 'hold_payment', '{\"risk_score\":{\"=>\":0.8}}', 'auto')"
+    )
+    conn.commit()
+    tier, rule = agent_tools.evaluate_policy(conn, "hold_payment", {"risk_score": 0.9, "amount": 100})
+    assert tier == "approval_required" and rule == "default_fail_safe", f"malformed operator: {tier}, {rule}"
+    conn.close(); os.remove(path)
+
+
+def t_smtp_port_non_numeric_soft_fails():
+    """SMTP_PORT='not-a-number' used to raise an uncaught ValueError out of
+    send_merchant_email(), contradicting its own docstring promise that a
+    misconfiguration always returns sent=False rather than raising -- found
+    by actually setting the env var and calling it. Fixed: the int(PORT)
+    parse now lives inside the same try/except as the rest of the send."""
+    env_keys = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "MERCHANT_EMAIL_TO"]
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.update({
+            "SMTP_HOST": "smtp.example.com", "SMTP_PORT": "not-a-number",
+            "SMTP_USER": "u", "SMTP_PASSWORD": "p", "SMTP_FROM": "a@example.com",
+            "MERCHANT_EMAIL_TO": "b@example.com",
+        })
+        r = notify_channel.send_merchant_email("subj", "body")
+        assert r == {"sent": False, "channel": "email",
+                     "detail": "send failed: invalid literal for int() with base 10: 'not-a-number'"}, r
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # ============================================================================
@@ -312,12 +406,15 @@ CASES = [
     ("single-row audit chain verifies intact", t_single_row_audit_chain),
     ("tamper last row -> detected", t_tamper_last_row_detected),
     ("tamper middle row -> detected at that row", t_tamper_middle_row_breaks_everything_after),
+    ("12 real threads racing to log_agent_action -> chain stays intact", t_concurrent_writers_dont_break_the_chain),
     ("risk_score exactly 0.8 (boundary)", t_boundary_score_exactly_0_8),
     ("risk_score just below 0.8 (boundary)", t_boundary_score_just_below_0_8),
     ("amount exactly 1,000,000 (boundary)", t_boundary_amount_exactly_1000000),
     ("amount 1,000,001 (boundary)", t_boundary_amount_1000001),
     ("payment with no risk score at all", t_no_risk_score_at_all),
     ("unknown action_type fails safe", t_unknown_action_type_fails_safe),
+    ("malformed operator in condition_json fails safe", t_malformed_operator_in_condition_fails_safe),
+    ("SMTP_PORT non-numeric soft-fails instead of raising", t_smtp_port_non_numeric_soft_fails),
 ]
 
 if __name__ == "__main__":

@@ -46,7 +46,6 @@ def send_merchant_email(subject: str, body: str) -> dict:
         return {"sent": False, "channel": "email", "detail": f"stubbed — not configured (missing: {', '.join(missing)})"}
 
     host = os.environ["SMTP_HOST"]
-    port = int(os.environ["SMTP_PORT"])
     user = os.environ["SMTP_USER"]
     password = os.environ["SMTP_PASSWORD"]
     sender = os.environ["SMTP_FROM"]
@@ -57,11 +56,16 @@ def send_merchant_email(subject: str, body: str) -> dict:
     msg["From"] = sender
     msg["To"] = recipient
 
+    # int(SMTP_PORT) is inside the try too (Day 10 edge-case pass, found by
+    # actually setting SMTP_PORT to a non-numeric string): a malformed env
+    # var is a config failure like any other here, not a crash — the whole
+    # point of this function is that nothing it does ever raises.
     try:
+        port = int(os.environ["SMTP_PORT"])
         with smtplib.SMTP(host, port, timeout=15) as server:
             server.starttls()
             server.login(user, password)
             server.sendmail(sender, [recipient], msg.as_string())
         return {"sent": True, "channel": "email", "detail": f"sent to {recipient}"}
-    except (smtplib.SMTPException, OSError, TimeoutError) as e:
+    except (smtplib.SMTPException, OSError, TimeoutError, ValueError) as e:
         return {"sent": False, "channel": "email", "detail": f"send failed: {e}"}

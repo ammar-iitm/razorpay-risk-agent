@@ -109,6 +109,29 @@ click sequence plus a full normal-flow regression (seed, view, tamper,
 verify-broken, repair-as-no-op, metrics) against the fix — clean
 throughout. (Day 10, edge-case sweep)
 
+**Two connections racing to write the audit log could make an untampered
+chain report itself as tampered.** `log_agent_action()` read the current
+"last hash" with a plain `SELECT`, then inserted and committed — a
+`SELECT` never blocks a writer in SQLite's default rollback-journal mode,
+so two connections writing at nearly the same time (e.g. the dashboard and
+a live agent run hitting the same `risk_agent.db`) could both read the
+same last hash before either committed. The second writer's `this_hash`
+then got computed from a `prev_hash` that was already stale by the time
+its row actually landed at the next `id`, and `verify_audit_chain()` —
+which recomputes hashes strictly in `id` order — reported that mismatch as
+tampering that never happened, a false positive against this project's own
+core tamper-evidence claim. Found with real threads, not a manual
+simulation or code reading: 12 threads racing `log_agent_action()` against
+the same payment broke the chain in 5/5 trials before the fix. Fixed by
+wrapping the read-then-insert in one `BEGIN IMMEDIATE` transaction, so a
+second writer's own `BEGIN IMMEDIATE` blocks (SQLite's busy handler
+auto-retries for `connect()`'s 5-second default timeout) until the first
+commits and it can see the real last hash. Re-ran the same 12-thread race
+20 times after the fix — chain intact every time, 0/20 — and re-verified
+every other suite (all three day10 suites, `--demo`, and the live
+dashboard's real seed/tamper/audit flow through a running server) still
+behaves identically. (Day 10, concurrency pass)
+
 **A stretch-goal file was built under the wrong day.** The Day 5 ML
 classifier was initially written and named as if it were Day 8 work,
 contradicting the actual build plan. Caught directly, not by me — fixed by

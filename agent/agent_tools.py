@@ -115,29 +115,51 @@ def log_agent_action(
 ) -> int:
     """The ONLY function allowed to write to agent_actions. Every write is
     chained to the previous row's hash, so anyone can later call
-    verify_audit_chain() and prove nothing was edited after the fact."""
-    prev_hash = _get_last_hash(conn)
-    created_at = int(time.time())
-    payload = {
-        "payment_id": payment_id, "dispute_id": dispute_id, "action_type": action_type,
-        "decision_tier": decision_tier, "risk_score_at_decision": risk_score_at_decision,
-        "policy_rule_applied": policy_rule_applied, "agent_reasoning": agent_reasoning,
-        "tool_input": _canonical(tool_input), "tool_output": _canonical(tool_output or {}),
-        "actor": actor, "approved_by": approved_by, "prev_hash": prev_hash,
-        "created_at": created_at,
-    }
-    this_hash = hashlib.sha256((prev_hash + _canonical(payload)).encode()).hexdigest()
-    cur = conn.execute(
-        """INSERT INTO agent_actions
-           (payment_id, dispute_id, action_type, decision_tier, risk_score_at_decision,
-            policy_rule_applied, agent_reasoning, tool_input, tool_output, actor,
-            approved_by, prev_hash, this_hash, created_at)
-           VALUES (:payment_id,:dispute_id,:action_type,:decision_tier,:risk_score_at_decision,
-                   :policy_rule_applied,:agent_reasoning,:tool_input,:tool_output,:actor,
-                   :approved_by,:prev_hash,:this_hash,:created_at)""",
-        {**payload, "this_hash": this_hash},
-    )
-    conn.commit()
+    verify_audit_chain() and prove nothing was edited after the fact.
+
+    Reads prev_hash and inserts inside one BEGIN IMMEDIATE transaction.
+    Without this, two connections racing to write (e.g. the dashboard and a
+    live agent run hitting the same risk_agent.db at once) could both read
+    the same "last" hash via the plain SELECT in _get_last_hash() before
+    either commits -- a SELECT never blocks a writer in SQLite's default
+    rollback-journal mode. The second writer's this_hash then gets computed
+    from a prev_hash that's already stale by the time its row actually
+    lands, and verify_audit_chain() reports that as tampering that never
+    happened -- a false positive against this project's own tamper-evidence
+    claim. BEGIN IMMEDIATE grabs the write lock before the read instead of
+    at the first write, so a second writer's own BEGIN IMMEDIATE blocks
+    (auto-retried by SQLite's busy handler for up to connect()'s 5s default
+    timeout) until this transaction commits and it can see the real last
+    hash. Day 10 concurrency pass -- confirmed the race with real threads
+    (5/5 trials broke the chain without this, 0/12 with it), not by
+    inspection."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        prev_hash = _get_last_hash(conn)
+        created_at = int(time.time())
+        payload = {
+            "payment_id": payment_id, "dispute_id": dispute_id, "action_type": action_type,
+            "decision_tier": decision_tier, "risk_score_at_decision": risk_score_at_decision,
+            "policy_rule_applied": policy_rule_applied, "agent_reasoning": agent_reasoning,
+            "tool_input": _canonical(tool_input), "tool_output": _canonical(tool_output or {}),
+            "actor": actor, "approved_by": approved_by, "prev_hash": prev_hash,
+            "created_at": created_at,
+        }
+        this_hash = hashlib.sha256((prev_hash + _canonical(payload)).encode()).hexdigest()
+        cur = conn.execute(
+            """INSERT INTO agent_actions
+               (payment_id, dispute_id, action_type, decision_tier, risk_score_at_decision,
+                policy_rule_applied, agent_reasoning, tool_input, tool_output, actor,
+                approved_by, prev_hash, this_hash, created_at)
+               VALUES (:payment_id,:dispute_id,:action_type,:decision_tier,:risk_score_at_decision,
+                       :policy_rule_applied,:agent_reasoning,:tool_input,:tool_output,:actor,
+                       :approved_by,:prev_hash,:this_hash,:created_at)""",
+            {**payload, "this_hash": this_hash},
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return cur.lastrowid
 
 
@@ -174,7 +196,14 @@ def _condition_matches(condition: dict, context: dict) -> bool:
         if field not in context or context[field] is None:
             return False
         for op, value in clauses.items():
-            if not _OPS[op](context[field], value):
+            fn = _OPS.get(op)
+            # An unrecognized operator (a policy_config typo, e.g. "=>"
+            # instead of ">=") is a malformed rule, not a match — treating
+            # it as "doesn't match" keeps evaluate_policy()'s own fail-safe
+            # default (approval_required) in force instead of KeyError-ing
+            # the whole tool call (Day 10 edge-case pass, found by actually
+            # inserting a mistyped operator and calling evaluate_policy()).
+            if fn is None or not fn(context[field], value):
                 return False
     return True
 
