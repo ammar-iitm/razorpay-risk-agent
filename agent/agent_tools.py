@@ -636,11 +636,12 @@ async def run_agent(user_prompt: str, conn: Optional[sqlite3.Connection] = None,
             "you haven't already scored earlier in this conversation."
         ),
         mcp_servers={"risk": risk_server},
-        allowed_tools=[
-            "mcp__risk__get_risk_assessment", "mcp__risk__hold_payment", "mcp__risk__release_payment",
-            "mcp__risk__draft_dispute_evidence", "mcp__risk__submit_dispute_evidence",
-            "mcp__risk__accept_dispute", "mcp__risk__notify_merchant",
-        ],
+        # NOTE: deliberately NOT using allowed_tools here — an allowed_tools
+        # entry for a whole tool auto-approves it before can_use_tool is ever
+        # consulted (CanUseToolShadowedWarning), which would make
+        # _validate_tool_input's malformed-id check a silent no-op in this
+        # live path (caught during final pre-submission testing — see
+        # day1/calculator_with_gate.py for the same fix on the toy example).
         can_use_tool=_validate_tool_input,
         permission_mode="default",
         max_turns=max_turns,

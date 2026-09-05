@@ -32,3 +32,7 @@ day5/model.joblib
 
 # OS cruft
 .DS_Store
+
+# Files delivered into this folder by the Claude desktop app (pitch video,
+# prep notes) — working material, not part of the submission.
+Claude outputs/
