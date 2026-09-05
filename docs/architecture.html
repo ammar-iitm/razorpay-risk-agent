@@ -1,0 +1,180 @@
+<title>Risk Agent Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground: #0d1016;
+    --text:   #e8ecf3;
+    --dim:    #8a93a5;
+    --faint:  #2b3240;
+    --panel:  #161b24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--ground); color: var(--text);
+    font-family: Archivo, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 40px 48px;
+  }
+  figure { margin: 0; width: 100%; max-width: 1400px; }
+  .head { margin-bottom: 26px; }
+  .head .eyebrow {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--dim);
+    letter-spacing: .18em; text-transform: uppercase; margin-bottom: 9px;
+  }
+  .head h1 { font-size: 27px; font-weight: 700; margin: 0; letter-spacing: -.01em; }
+  svg { width: 100%; height: auto; display: block; }
+  figcaption {
+    margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--faint);
+    display: flex; gap: 34px; flex-wrap: wrap;
+  }
+  .q { flex: 1; min-width: 220px; }
+  .q .n {
+    font-family: "IBM Plex Mono", monospace; font-size: 10px; color: #4d8df0;
+    letter-spacing: .16em; margin-bottom: 6px;
+  }
+  .q .t { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .q .a { font-size: 13px; color: var(--dim); line-height: 1.5; }
+</style>
+
+<figure>
+  <div class="head">
+    <div class="eyebrow">Razorpay AI Buildathon &middot; AI Risk Manager</div>
+    <h1>Every money action is gated by a table, and every outcome is chained</h1>
+  </div>
+
+  <svg viewBox="0 0 1400 560" role="img"
+       aria-label="Detection pipeline feeds a Claude Agent SDK loop; every tool call passes through evaluate_policy, which reads the policy_config table and returns one of three autonomy tiers — auto, approval_required, or never_auto — and every outcome is written to the hash-chained agent_actions log.">
+    <defs>
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+      </marker>
+      <marker id="ah-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#4d8df0"/>
+      </marker>
+    </defs>
+
+    <!-- ============ 1. DETECTION PIPELINE (left column) ============ -->
+    <text x="40" y="52" font-family="IBM Plex Mono, monospace" font-size="11"
+          fill="currentColor" opacity=".55" letter-spacing="2.4">1 &nbsp;DETECTION</text>
+
+    <g font-family="Archivo, sans-serif">
+      <rect x="40" y="70" width="210" height="56" rx="7" fill="none" stroke="currentColor" stroke-opacity=".38"/>
+      <text x="56" y="93" font-size="14" font-weight="600" fill="currentColor">Razorpay API</text>
+      <text x="56" y="112" font-size="11.5" fill="currentColor" opacity=".55">live test mode</text>
+
+      <rect x="40" y="150" width="210" height="56" rx="7" fill="none" stroke="currentColor" stroke-opacity=".38"/>
+      <text x="56" y="173" font-size="14" font-weight="600" fill="currentColor">transactions</text>
+      <text x="56" y="192" font-size="11.5" fill="currentColor" opacity=".55">raw fact table</text>
+
+      <rect x="40" y="230" width="210" height="56" rx="7" fill="none" stroke="currentColor" stroke-opacity=".38"/>
+      <text x="56" y="253" font-size="14" font-weight="600" fill="currentColor">Rule engine</text>
+      <text x="56" y="272" font-size="11.5" fill="currentColor" opacity=".55">velocity &middot; z-score &middot; new email</text>
+
+      <rect x="40" y="310" width="210" height="56" rx="7" fill="none" stroke="currentColor" stroke-opacity=".38"/>
+      <text x="56" y="333" font-size="14" font-weight="600" fill="currentColor">risk_scores</text>
+      <text x="56" y="352" font-size="11.5" fill="currentColor" opacity=".55">score + reason codes</text>
+    </g>
+
+    <g stroke="currentColor" stroke-opacity=".5" stroke-width="1.4" fill="none" color="currentColor">
+      <line x1="145" y1="126" x2="145" y2="146" marker-end="url(#ah)"/>
+      <line x1="145" y1="206" x2="145" y2="226" marker-end="url(#ah)"/>
+      <line x1="145" y1="286" x2="145" y2="306" marker-end="url(#ah)"/>
+    </g>
+
+    <!-- ============ 2. AGENT LOOP ============ -->
+    <text x="300" y="52" font-family="IBM Plex Mono, monospace" font-size="11"
+          fill="currentColor" opacity=".55" letter-spacing="2.4">2 &nbsp;DECISION</text>
+
+    <line x1="252" y1="338" x2="296" y2="338" stroke="currentColor" stroke-opacity=".5"
+          stroke-width="1.4" marker-end="url(#ah)" color="currentColor"/>
+    <text x="274" y="328" font-size="11" font-family="IBM Plex Mono, monospace"
+          fill="currentColor" opacity=".6" text-anchor="middle">reads</text>
+
+    <rect x="300" y="285" width="240" height="110" rx="8" fill="none" stroke="currentColor" stroke-opacity=".38"/>
+    <text x="318" y="315" font-size="15" font-weight="600" fill="currentColor" font-family="Archivo, sans-serif">Claude Agent SDK loop</text>
+    <text x="318" y="337" font-size="11.5" fill="currentColor" opacity=".55" font-family="Archivo, sans-serif">picks among 7 tools:</text>
+    <text x="318" y="357" font-size="11" fill="currentColor" opacity=".72" font-family="IBM Plex Mono, monospace">hold &middot; release &middot; notify</text>
+    <text x="318" y="375" font-size="11" fill="currentColor" opacity=".72" font-family="IBM Plex Mono, monospace">draft &middot; submit &middot; accept &middot; assess</text>
+
+    <!-- the arrow the whole claim turns on -->
+    <line x1="542" y1="338" x2="644" y2="338" stroke="#4d8df0" stroke-width="2.4"
+          marker-end="url(#ah-a)"/>
+    <text x="593" y="327" font-size="11.5" font-weight="600" font-family="IBM Plex Mono, monospace"
+          fill="#4d8df0" text-anchor="middle">every tool call</text>
+    
+
+    <!-- ============ 3. THE GATE ============ -->
+    <rect x="650" y="180" width="290" height="320" rx="10" fill="#4d8df0" fill-opacity=".07"
+          stroke="#4d8df0" stroke-opacity=".65" stroke-width="1.6"/>
+    <text x="670" y="212" font-size="16" font-weight="700" fill="#4d8df0" font-family="IBM Plex Mono, monospace">evaluate_policy()</text>
+    <text x="670" y="234" font-size="12" fill="currentColor" opacity=".7" font-family="Archivo, sans-serif">reads <tspan font-family="IBM Plex Mono, monospace">policy_config</tspan> &mdash; a table, not a prompt</text>
+
+    <g font-family="Archivo, sans-serif">
+      <rect x="670" y="256" width="250" height="66" rx="7" fill="#2f9e5e" fill-opacity=".12" stroke="#2f9e5e" stroke-opacity=".6"/>
+      <text x="688" y="281" font-size="13.5" font-weight="700" fill="#3fbe76" font-family="IBM Plex Mono, monospace">auto</text>
+      <text x="688" y="303" font-size="12" fill="currentColor" opacity=".72">executes, then logs it</text>
+
+      <rect x="670" y="334" width="250" height="66" rx="7" fill="#c08a00" fill-opacity=".12" stroke="#c08a00" stroke-opacity=".6"/>
+      <text x="688" y="359" font-size="13.5" font-weight="700" fill="#dda800" font-family="IBM Plex Mono, monospace">approval_required</text>
+      <text x="688" y="381" font-size="12" fill="currentColor" opacity=".72">logs it, changes nothing</text>
+
+      <rect x="670" y="412" width="250" height="66" rx="7" fill="#cf3f43" fill-opacity=".12" stroke="#cf3f43" stroke-opacity=".6"/>
+      <text x="688" y="437" font-size="13.5" font-weight="700" fill="#e8595d" font-family="IBM Plex Mono, monospace">never_auto</text>
+      <text x="688" y="459" font-size="12" fill="currentColor" opacity=".72">refused in code, not just policy</text>
+    </g>
+
+    <!-- ============ 4. AUDIT LOG ============ -->
+    <text x="1030" y="52" font-family="IBM Plex Mono, monospace" font-size="11"
+          fill="currentColor" opacity=".55" letter-spacing="2.4">3 &nbsp;EVIDENCE</text>
+
+    <line x1="942" y1="338" x2="1026" y2="338" stroke="currentColor" stroke-opacity=".5"
+          stroke-width="1.4" marker-end="url(#ah)" color="currentColor"/>
+    <text x="984" y="326" font-size="11" font-family="IBM Plex Mono, monospace"
+          fill="currentColor" opacity=".6" text-anchor="middle">outcome</text>
+    <text x="984" y="364" font-size="11" font-family="IBM Plex Mono, monospace"
+          fill="currentColor" opacity=".6" text-anchor="middle">+ reasoning</text>
+
+    <rect x="1030" y="240" width="330" height="200" rx="10" fill="none"
+          stroke="#3fbe76" stroke-opacity=".55" stroke-width="1.6"/>
+    <text x="1052" y="272" font-size="15" font-weight="700" fill="#3fbe76" font-family="IBM Plex Mono, monospace">agent_actions</text>
+    <text x="1052" y="293" font-size="12" fill="currentColor" opacity=".7" font-family="Archivo, sans-serif">append-only &middot; hash-chained</text>
+
+    <!-- mini chain, echoing the live dashboard -->
+    <g>
+      <rect x="1052" y="312" width="52" height="42" rx="5" fill="#2f9e5e" fill-opacity=".14" stroke="#3fbe76" stroke-opacity=".6"/>
+      <text x="1078" y="338" font-size="11" fill="#3fbe76" text-anchor="middle" font-family="IBM Plex Mono, monospace">#1</text>
+      <line x1="1104" y1="333" x2="1120" y2="333" stroke="#3fbe76" stroke-opacity=".6" stroke-width="1.6"/>
+      <rect x="1120" y="312" width="52" height="42" rx="5" fill="#2f9e5e" fill-opacity=".14" stroke="#3fbe76" stroke-opacity=".6"/>
+      <text x="1146" y="338" font-size="11" fill="#3fbe76" text-anchor="middle" font-family="IBM Plex Mono, monospace">#2</text>
+      <line x1="1172" y1="333" x2="1188" y2="333" stroke="#3fbe76" stroke-opacity=".6" stroke-width="1.6"/>
+      <rect x="1188" y="312" width="52" height="42" rx="5" fill="#2f9e5e" fill-opacity=".14" stroke="#3fbe76" stroke-opacity=".6"/>
+      <text x="1214" y="338" font-size="11" fill="#3fbe76" text-anchor="middle" font-family="IBM Plex Mono, monospace">#3</text>
+      <line x1="1240" y1="333" x2="1256" y2="333" stroke="#3fbe76" stroke-opacity=".6" stroke-width="1.6"/>
+      <rect x="1256" y="312" width="52" height="42" rx="5" fill="#2f9e5e" fill-opacity=".14" stroke="#3fbe76" stroke-opacity=".6"/>
+      <text x="1282" y="338" font-size="11" fill="#3fbe76" text-anchor="middle" font-family="IBM Plex Mono, monospace">#4</text>
+    </g>
+    <text x="1052" y="382" font-size="11.5" fill="currentColor" opacity=".78" font-family="IBM Plex Mono, monospace">this_hash = sha256(prev_hash + row)</text>
+    <text x="1052" y="406" font-size="11.5" fill="currentColor" opacity=".55" font-family="Archivo, sans-serif">edit any row and every row after it</text>
+    <text x="1052" y="424" font-size="11.5" fill="currentColor" opacity=".55" font-family="Archivo, sans-serif">provably breaks</text>
+  </svg>
+
+  <figcaption>
+    <div class="q">
+      <div class="n">ANSWERS</div>
+      <div class="t">Why did it do that?</div>
+      <div class="a">The score, its reason codes, and the agent's own reasoning are logged verbatim against every action.</div>
+    </div>
+    <div class="q">
+      <div class="n">ANSWERS</div>
+      <div class="t">Can I trust the record?</div>
+      <div class="a">The log is hash-chained, so tampering is detectable rather than a matter of trust.</div>
+    </div>
+    <div class="q">
+      <div class="n">ANSWERS</div>
+      <div class="t">Was it bounded?</div>
+      <div class="a">Authority lives in <code>policy_config</code>, a versioned table — changing what the agent may do is a config change, not a prompt edit.</div>
+    </div>
+  </figcaption>
+</figure>

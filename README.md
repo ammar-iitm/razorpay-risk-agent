@@ -58,7 +58,14 @@ Real screenshots of the dashboard above, running against real (seeded) data — 
 
 ## Architecture
 
+![Architecture: every tool call passes through evaluate_policy, which reads the policy_config table and returns one of three autonomy tiers, and every outcome is written to the hash-chained agent_actions log](docs/architecture.png)
+
+The thing worth looking at is the middle column. `evaluate_policy()` isn't advisory and it isn't a prompt instruction — it's a function every single tool call routes through, and it returns one of three tiers read from a versioned database table. `auto` executes and logs. `approval_required` logs the decision and changes nothing. `never_auto` is refused in code, not merely discouraged by policy. Whichever it returns, the outcome and the agent's own reasoning land in `agent_actions`, where each row's hash is computed over the previous one — so editing history after the fact is detectable rather than a matter of trust.
+
 Full writeup, including the rationale behind every policy threshold, the hybrid rule-engine/ML scoping decision, and known limitations stated plainly: **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
+
+<details>
+<summary>Same diagram as mermaid source</summary>
 
 ```mermaid
 flowchart LR
@@ -70,6 +77,8 @@ flowchart LR
     AG -->|tool call| PG{evaluate_policy}
     PG --> AA[agent_actions\nhash-chained audit log]
 ```
+
+</details>
 
 ## Real results, not claimed ones
 
